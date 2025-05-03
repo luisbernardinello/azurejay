@@ -1,8 +1,10 @@
 venv
+.venv
 __pycache__
 .pdm-python
 .next
 node_modules
 test-results
 **/*.tsbuildinfo
+.env
 
