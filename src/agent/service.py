@@ -1,219 +1,250 @@
-from datetime import datetime, timedelta
 import json
-import redis
 import logging
-from typing import List, Dict, Any, Optional
+import os
 from uuid import UUID
+from dotenv import load_dotenv
+import redis
 
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.runnables.config import RunnableConfig
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.store.memory import MemoryStore
+from trustcall import create_extractor
 
-from .utils import initialize_model, extract_profile_from_conversation
-from .models import ChatRequest, ChatResponse, Profile, Conversation
-from .agent_graph import agent_graph
+from . import models
+from ..conversations import service as conversation_service
 
-# Initialize model
-model = initialize_model()
+env_path = os.path.join(os.path.dirname(__file__), '.env')
+load_dotenv(env_path)
+# Constants
+MODEL_SYSTEM_MESSAGE = """You are a helpful assistant with memory that provides information about the user.
+If you have memory for this user, use it to personalize your responses. Here is the memory (it may be empty): {memory}"""
 
-# Initialize Redis connection
-# You should move this to environment variables
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-REDIS_DB = 0
-CONVERSATION_EXPIRY = 60 * 60 * 24 * 7  # 7 days in seconds
+TRUSTCALL_INSTRUCTION = """Create or update the memory (JSON doc) to incorporate information from the following conversation:"""
 
-try:
-    redis_client = redis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=REDIS_DB,
-        decode_responses=True
+# Memory key patterns
+def get_memory_key(user_id: UUID) -> str:
+    """Generate Redis key for storing agent memory for a user"""
+    return f"agent:memory:{user_id}"
+
+
+def initialize_agent(model_name: str = "gemini-1.5-flash", temperature: float = 0.2):
+    """Initialize the agent components"""
+    # Initialize the LLM
+    model = ChatGoogleGenerativeAI(model=model_name, temperature=temperature)
+    
+    # Create the memory extractor
+    trustcall_extractor = create_extractor(
+        model,
+        tools=[models.UserProfileMemory],
+        tool_choice="UserProfileMemory"  # Enforces use of the UserProfileMemory tool
     )
-    # Test connection
-    redis_client.ping()
-    logging.info("Successfully connected to Redis")
-except Exception as e:
-    logging.error(f"Failed to connect to Redis: {str(e)}")
-    redis_client = None
-
-def store_conversation(user_id: UUID, user_message: str, agent_response: str) -> bool:
-    """Store a conversation in Redis."""
-    if not redis_client:
-        logging.error("Redis client not available")
-        return False
     
-    try:
-        # Create conversation record
-        conversation = Conversation(
-            timestamp=datetime.now(),
-            user_message=user_message,
-            agent_response=agent_response
+    # Store these in a dict to pass around
+    components = {
+        "model": model,
+        "extractor": trustcall_extractor
+    }
+    
+    return components
+
+
+def call_model(state: MessagesState, config: RunnableConfig, components: dict, redis_client: redis.Redis):
+    """
+    Load memory from Redis and use it to personalize the chatbot's response.
+    """
+    # Get the user ID from the config
+    user_id = config["configurable"]["user_id"]
+    conversation_id = config["configurable"]["conversation_id"]
+    
+    # Retrieve memory from Redis
+    memory_key = get_memory_key(user_id)
+    memory_json = redis_client.get(memory_key)
+    memory = json.loads(memory_json) if memory_json else None
+    
+    # Format the memories for the system prompt
+    if memory:
+        formatted_memory = (
+            f"Name: {memory.get('user_name', 'Unknown')}\n"
+            f"Location: {memory.get('user_location', 'Unknown')}\n"
+            f"Interests: {', '.join(memory.get('user_interests', []))}"
         )
-        
-        # Store in Redis with expiration
-        conversation_key = f"conversation:{user_id}:{datetime.now().isoformat()}"
-        redis_client.set(
-            conversation_key,
-            json.dumps(conversation.model_dump()),
-            ex=CONVERSATION_EXPIRY
-        )
-        return True
-    except Exception as e:
-        logging.error(f"Error storing conversation: {str(e)}")
-        return False
-
-def get_recent_conversations(user_id: UUID, limit: int = 5) -> List[Conversation]:
-    """Get recent conversations for a user from Redis."""
-    if not redis_client:
-        logging.error("Redis client not available")
-        return []
+    else:
+        formatted_memory = "No memory available yet."
     
-    try:
-        # Get all keys for this user's conversations
-        pattern = f"conversation:{user_id}:*"
-        conversation_keys = redis_client.keys(pattern)
-        
-        # Sort by timestamp (which is in the key)
-        conversation_keys.sort(reverse=True)
-        
-        # Get the most recent conversations
-        recent_keys = conversation_keys[:limit]
-        conversations = []
-        
-        for key in recent_keys:
-            conversation_data = redis_client.get(key)
-            if conversation_data:
-                try:
-                    conversation = Conversation(**json.loads(conversation_data))
-                    conversations.append(conversation)
-                except Exception as e:
-                    logging.error(f"Error parsing conversation data: {str(e)}")
-        
-        return conversations
-    except Exception as e:
-        logging.error(f"Error retrieving conversations: {str(e)}")
-        return []
-
-def get_user_profile(user_id: UUID) -> Optional[Profile]:
-    """Get the user profile from Redis."""
-    if not redis_client:
-        logging.error("Redis client not available")
-        return None
+    # Format the memory in the system prompt
+    system_msg = MODEL_SYSTEM_MESSAGE.format(memory=formatted_memory)
     
-    try:
-        profile_key = f"profile:{user_id}"
-        profile_data = redis_client.get(profile_key)
-        
-        if profile_data:
-            return Profile(**json.loads(profile_data))
-        return None
-    except Exception as e:
-        logging.error(f"Error retrieving user profile: {str(e)}")
-        return None
-
-def store_user_profile(user_id: UUID, profile: Profile) -> bool:
-    """Store the user profile in Redis."""
-    if not redis_client:
-        logging.error("Redis client not available")
-        return False
+    # Respond using memory as well as the chat history
+    response = components["model"].invoke([SystemMessage(content=system_msg)] + state["messages"])
     
-    try:
-        profile_key = f"profile:{user_id}"
-        redis_client.set(
-            profile_key,
-            json.dumps(profile.model_dump())
-        )  # No expiration for profiles
-        return True
-    except Exception as e:
-        logging.error(f"Error storing user profile: {str(e)}")
-        return False
+    # Log the response for debugging
+    logging.info(f"Generated response for user {user_id}, conversation {conversation_id}")
+    
+    return {"messages": state["messages"] + [response]}
 
-def update_profile_if_needed(user_id: UUID, conversation_history: List) -> bool:
-    """Check if we need to update the user profile and do so if needed."""
-    try:
-        # Get current profile
-        current_profile = get_user_profile(user_id)
-        
-        # If no profile exists, or profile is minimal, extract one
-        if not current_profile or (not current_profile.name and len(current_profile.interests) < 2):
-            # Extract profile from conversation
-            new_profile = extract_profile_from_conversation(model, conversation_history)
-            
-            # Merge with existing profile if there is one
-            if current_profile:
-                # Keep non-empty values from current profile
-                for field, value in current_profile.model_dump().items():
-                    if value and not getattr(new_profile, field):
-                        setattr(new_profile, field, value)
-            
-            # Store updated profile
-            store_user_profile(user_id, new_profile)
-            return True
-        
-        return False
-    except Exception as e:
-        logging.error(f"Error updating profile: {str(e)}")
-        return False
 
-def chat_with_agent(chat_request: ChatRequest) -> ChatResponse:
-    """Process a chat request through the agent."""
+def write_memory(state: MessagesState, config: RunnableConfig, components: dict, redis_client: redis.Redis):
+    """
+    Reflect on the chat history and save memory to Redis.
+    """
+    # Get the user ID from the config
+    user_id = config["configurable"]["user_id"]
+    
+    # Retrieve existing memory from Redis
+    memory_key = get_memory_key(user_id)
+    memory_json = redis_client.get(memory_key)
+    existing_memory = json.loads(memory_json) if memory_json else None
+    
+    # Prepare the existing profile for the extractor
+    existing_profile = {"UserProfileMemory": existing_memory} if existing_memory else None
+    
+    # Invoke the extractor
+    result = components["extractor"].invoke({
+        "messages": [SystemMessage(content=TRUSTCALL_INSTRUCTION)] + state["messages"], 
+        "existing": existing_profile
+    })
+    
+    # Get the updated profile as a JSON object
+    updated_profile = result["responses"][0].model_dump()
+    
+    # Save the updated profile to Redis
+    redis_client.set(memory_key, json.dumps(updated_profile))
+    logging.info(f"Updated memory for user {user_id}")
+    
+    return {"messages": state["messages"], "memory": updated_profile}
+
+
+def create_agent_graph(components: dict, redis_client: redis.Redis):
+    """
+    Create the langgraph for the agent
+    """
+    # Define the nodes that will make up our graph
+    def call_model_with_components(state, config):
+        return call_model(state, config, components, redis_client)
+    
+    def write_memory_with_components(state, config):
+        return write_memory(state, config, components, redis_client)
+    
+    # Create the graph
+    builder = StateGraph(MessagesState)
+    builder.add_node("call_model", call_model_with_components)
+    builder.add_node("write_memory", write_memory_with_components)
+    
+    # Define the edges
+    builder.add_edge(START, "call_model")
+    builder.add_edge("call_model", "write_memory")
+    builder.add_edge("write_memory", END)
+    
+    # Compile the graph
+    return builder.compile()
+
+
+def process_message(
+    redis_client: redis.Redis, 
+    user_id: UUID, 
+    conversation_id: UUID, 
+    message: str,
+    model_name: str = "gemini-1.5-flash",
+    temperature: float = 0
+) -> models.AgentResponse:
+    """
+    Process a user message through the agent graph
+    """
     try:
-        user_id = chat_request.user_id
-        user_message = chat_request.message
+        # Initialize or get components
+        components = initialize_agent(model_name, temperature)
         
-        # Get user profile
-        profile = get_user_profile(user_id)
-        profile_text = profile.model_dump_json() if profile else "No profile available yet"
+        # Create the graph
+        graph = create_agent_graph(components, redis_client)
         
-        # Get recent conversations
-        recent_convs = get_recent_conversations(user_id)
-        conversations_text = "\n".join([
-            f"[{c.timestamp.isoformat()}]\nUser: {c.user_message}\nAssistant: {c.agent_response}"
-            for c in recent_convs
-        ])
+        # Create the config
+        config = {
+            "configurable": {
+                "user_id": str(user_id),
+                "conversation_id": str(conversation_id)
+            }
+        }
         
-        # Create message history
-        history = []
-        for conv in recent_convs:
-            history.append(HumanMessage(content=conv.user_message))
-            history.append(AIMessage(content=conv.agent_response))
+        # Create the message state
+        # Get existing conversation messages from Redis
+        try:
+            conv_detail = conversation_service.get_conversation(redis_client, user_id, conversation_id)
+            messages = []
+            for msg in conv_detail.messages:
+                if msg.is_user:
+                    messages.append(HumanMessage(content=msg.content))
+                else:
+                    messages.append(AIMessage(content=msg.content))
+        except:
+            # If conversation doesn't exist or there's an error, start with just the new message
+            messages = []
         
         # Add the current message
-        history.append(HumanMessage(content=user_message))
+        messages.append(HumanMessage(content=message))
         
-        # Configure agent with user context
-        config = RunnableConfig(
-            configurable={
-                "user_id": str(user_id)
-            }
-        )
+        # Initial state
+        state = {"messages": messages}
         
-        # Process with agent graph
-        result = agent_graph.invoke(
-            {"messages": history},
-            config=config
-        )
+        # Run the graph
+        result = graph.invoke(state, config)
         
-        # Get the final message
-        final_message = result["messages"][-1]
-        agent_response = final_message.content
+        # Extract the response
+        response_messages = result["messages"]
+        last_message = response_messages[-1]
         
-        # Store the conversation
-        store_conversation(user_id, user_message, agent_response)
+        # Store the response message in the conversation
+        message_request = conversation_service.models.MessageRequest(content=message)
+        conversation_service.add_message(redis_client, user_id, conversation_id, message_request, is_user=True)
         
-        # Update profile if needed
-        updated_profile = update_profile_if_needed(
-            user_id, 
-            history + [AIMessage(content=agent_response)]
-        )
+        # Store the AI response in the conversation
+        ai_message_request = conversation_service.models.MessageRequest(content=last_message.content)
+        conversation_service.add_message(redis_client, user_id, conversation_id, ai_message_request, is_user=False)
         
-        return ChatResponse(
-            response=agent_response,
-            updated_profile=updated_profile
+        # Get the updated memory
+        memory_key = get_memory_key(user_id)
+        memory_json = redis_client.get(memory_key)
+        updated_memory = json.loads(memory_json) if memory_json else None
+        
+        # Return the response
+        return models.AgentResponse(
+            message=last_message.content,
+            updated_memory=models.UserProfileMemory(**updated_memory) if updated_memory else None
         )
     except Exception as e:
-        logging.error(f"Error in chat_with_agent: {str(e)}")
-        return ChatResponse(
-            response=f"I'm sorry, I encountered an error while processing your message. Please try again later.",
-            updated_profile=False
+        logging.error(f"Error processing message through agent: {str(e)}")
+        raise
+
+
+def get_user_memory(redis_client: redis.Redis, user_id: UUID) -> models.AgentMemoryResponse:
+    """
+    Get the agent's memory for a user
+    """
+    try:
+        # Retrieve memory from Redis
+        memory_key = get_memory_key(user_id)
+        memory_json = redis_client.get(memory_key)
+        memory = json.loads(memory_json) if memory_json else None
+        
+        return models.AgentMemoryResponse(
+            user_id=user_id,
+            memory=models.UserProfileMemory(**memory) if memory else None
         )
+    except Exception as e:
+        logging.error(f"Error retrieving memory for user {user_id}: {str(e)}")
+        raise
+
+
+def reset_user_memory(redis_client: redis.Redis, user_id: UUID) -> None:
+    """
+    Reset (delete) the agent's memory for a user
+    """
+    try:
+        # Delete memory from Redis
+        memory_key = get_memory_key(user_id)
+        redis_client.delete(memory_key)
+        logging.info(f"Memory reset for user {user_id}")
+    except Exception as e:
+        logging.error(f"Error resetting memory for user {user_id}: {str(e)}")
+        raise

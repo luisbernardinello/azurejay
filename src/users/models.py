@@ -12,11 +12,10 @@ class UserResponse(BaseModel):
 
 class UserProfile(BaseModel):
     user_id: UUID
-    user_profile: str
-    user_difficulties: str
-    user_interests: str
+    user_name: str | None = None
+    user_difficulties: list[str] = []
+    user_interests: list[str] = []
     
-
 class PasswordChange(BaseModel):
     current_password: str
     new_password: str

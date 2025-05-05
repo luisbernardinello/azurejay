@@ -16,6 +16,15 @@ def get_user_by_id(db: Session, user_id: UUID) -> models.UserResponse:
     logging.info(f"Successfully retrieved user with ID: {user_id}")
     return user
 
+def get_user_profile(db: Session, user_id: UUID) -> models.UserProfile:
+    user = get_user_by_id(db, user_id)
+    
+    return models.UserProfile(
+        user_id=user.id,
+        user_name=user.user_name,
+        user_difficulties=user.user_difficulties or [],
+        user_interests=user.user_interests or []
+    )
 
 def change_password(db: Session, user_id: UUID, password_change: models.PasswordChange) -> None:
     try:
