@@ -3,14 +3,18 @@ import logging
 import os
 from uuid import UUID
 from dotenv import load_dotenv
+from fastapi import Depends
 import redis
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.runnables.config import RunnableConfig
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, MessagesState, START, END
-from langgraph.store.memory import MemoryStore
 from trustcall import create_extractor
+
+# from src.database.core import get_db
+from src.users.service import get_user_by_name
+from sqlalchemy.orm import Session
 
 from . import models
 from ..conversations import service as conversation_service
@@ -50,7 +54,7 @@ def initialize_agent(model_name: str = "gemini-1.5-flash", temperature: float = 
     return components
 
 
-def call_model(state: MessagesState, config: RunnableConfig, components: dict, redis_client: redis.Redis):
+def call_model(state: MessagesState, config: RunnableConfig, components: dict, redis_client: redis.Redis, db:Session):
     """
     Load memory from Redis and use it to personalize the chatbot's response.
     """
@@ -70,8 +74,9 @@ def call_model(state: MessagesState, config: RunnableConfig, components: dict, r
             f"Location: {memory.get('user_location', 'Unknown')}\n"
             f"Interests: {', '.join(memory.get('user_interests', []))}"
         )
-    else:
-        formatted_memory = "No memory available yet."
+    else: 
+        first_name = get_user_by_name(db, UUID(user_id))
+        formatted_memory = f"No memory available yet. Only the user's name is known. The user's name is: {first_name}."
     
     # Format the memory in the system prompt
     system_msg = MODEL_SYSTEM_MESSAGE.format(memory=formatted_memory)
@@ -116,13 +121,13 @@ def write_memory(state: MessagesState, config: RunnableConfig, components: dict,
     return {"messages": state["messages"], "memory": updated_profile}
 
 
-def create_agent_graph(components: dict, redis_client: redis.Redis):
+def create_agent_graph(components: dict, redis_client: redis.Redis, db: Session):
     """
     Create the langgraph for the agent
     """
     # Define the nodes that will make up our graph
     def call_model_with_components(state, config):
-        return call_model(state, config, components, redis_client)
+        return call_model(state, config, components, redis_client, db)
     
     def write_memory_with_components(state, config):
         return write_memory(state, config, components, redis_client)
@@ -142,7 +147,8 @@ def create_agent_graph(components: dict, redis_client: redis.Redis):
 
 
 def process_message(
-    redis_client: redis.Redis, 
+    redis_client: redis.Redis,
+    db: Session, 
     user_id: UUID, 
     conversation_id: UUID, 
     message: str,
@@ -157,7 +163,7 @@ def process_message(
         components = initialize_agent(model_name, temperature)
         
         # Create the graph
-        graph = create_agent_graph(components, redis_client)
+        graph = create_agent_graph(components, redis_client, db)
         
         # Create the config
         config = {

@@ -1,8 +1,9 @@
 from fastapi import APIRouter, status, HTTPException, Depends, BackgroundTasks
 from uuid import UUID
 from typing import List
+from sqlalchemy.orm import Session
 
-from src.database.core import RedisClient
+from src.database.core import RedisClient, get_db
 from src.auth.service import CurrentUser
 from . import models
 from . import service
@@ -18,9 +19,10 @@ router = APIRouter(
 async def process_message(
     conversation_id: UUID,
     agent_request: models.AgentRequest,
-    redis_client: RedisClient,
     current_user: CurrentUser,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    redis_client: RedisClient,
+    db: Session = Depends(get_db)
 ):
     """
     Process a message through the agent and store the conversation
@@ -40,6 +42,7 @@ async def process_message(
         # Process the message through the agent (this can be slow, consider moving to background)
         response = service.process_message(
             redis_client,
+            db,
             current_user.get_uuid(),
             conversation_id,
             agent_request.message

@@ -11,8 +11,8 @@ class UserResponse(BaseModel):
     
 
 class UserProfile(BaseModel):
-    user_id: UUID
-    user_name: str | None = None
+    id: UUID
+    first_name: str
     user_difficulties: list[str] = []
     user_interests: list[str] = []
     

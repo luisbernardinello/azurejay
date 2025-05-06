@@ -21,7 +21,7 @@ class AgentConfig(BaseModel):
 class AgentRequest(BaseModel):
     """Request to process a message with the agent"""
     message: str
-    conversation_id: UUID
+    # conversation_id: UUID
 
 
 class AgentResponse(BaseModel):

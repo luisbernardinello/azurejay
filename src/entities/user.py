@@ -15,7 +15,7 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     
     # user Profile
-    user_name = Column(String, nullable=True)
+
     user_difficulties = Column(ARRAY(String), nullable=True, default=[])
     user_interests = Column(ARRAY(String), nullable=True, default=[])
     

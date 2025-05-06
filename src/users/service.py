@@ -16,12 +16,17 @@ def get_user_by_id(db: Session, user_id: UUID) -> models.UserResponse:
     logging.info(f"Successfully retrieved user with ID: {user_id}")
     return user
 
+def get_user_by_name(db: Session, user_id: UUID) -> str:
+    """Get a user's first name by ID"""
+    user = get_user_by_id(db, user_id)
+    return user.first_name
+
 def get_user_profile(db: Session, user_id: UUID) -> models.UserProfile:
     user = get_user_by_id(db, user_id)
     
     return models.UserProfile(
-        user_id=user.id,
-        user_name=user.user_name,
+        id=user.id,
+        first_name=user.first_name,
         user_difficulties=user.user_difficulties or [],
         user_interests=user.user_interests or []
     )
