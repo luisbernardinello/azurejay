@@ -21,7 +21,6 @@ class AgentConfig(BaseModel):
 class AgentRequest(BaseModel):
     """Request to process a message with the agent"""
     message: str
-    # conversation_id: UUID
 
 
 class AgentResponse(BaseModel):
@@ -34,3 +33,4 @@ class AgentMemoryResponse(BaseModel):
     """Response containing the agent's memory for a user"""
     user_id: UUID
     memory: Optional[UserProfileMemory] = None
+    
