@@ -1,69 +1,54 @@
 import logging
-from typing import List, Dict, Any, Optional
-import math
+from langchain_core.runnables.config import RunnableConfig
+from langchain_community.tools import TavilySearchResults
+from langchain_community.document_loaders import WikipediaLoader
+from langchain_core.messages import HumanMessage
 
+from .models import EnhancedState
 
-def search_knowledge_base(query: str) -> List[Dict[str, Any]]:
-    """
-    Pesquisa na base de conhecimento por informações relevantes
+def search_web(state: EnhancedState, config: RunnableConfig):
+    """Retrieve docs from web search"""
     
-    Args:
-        query: Consulta de pesquisa
+    # Extract question from the last message
+    last_message = state["messages"][-1]
+    question = last_message.content
     
-    Returns:
-        Lista de documentos relevantes
-    """
-    logging.info(f"Searching knowledge base for: {query}")
+    # Initialize search tool here (following DI principle)
+    tavily_search = TavilySearchResults(max_results=1)
     
+    # Search
+    search_docs = tavily_search.invoke(question)
+    
+    # Format
+    formatted_search_docs = "\n\n---\n\n".join(
+        [
+            f'<Document href="{doc["url"]}"/>\n{doc["content"]}\n</Document>'
+            for doc in search_docs
+        ]
+    )
+    logging.info(f"Web search results: {formatted_search_docs}")
+    return {"context": [formatted_search_docs]}
 
-    return [
-        {
-            "title": "Documento de exemplo",
-            "content": "Este é um conteúdo simulado de conhecimento relacionado à consulta.",
-            "relevance": 0.85
-        }
-    ]
-
-
-def calculate(expression: str) -> float:
-    """
-    Executa um cálculo matemático
+def search_wikipedia(state: EnhancedState, config: RunnableConfig):
+    """Retrieve docs from wikipedia"""
     
-    Args:
-        expression: Expressão matemática a ser calculada
-    
-    Returns:
-        Resultado do cálculo
-    """
-    logging.info(f"Calculating: {expression}")
+    # Extract question from the last message
+    last_message = state["messages"][-1]
+    question = last_message.content
     
     try:
-        # AVISO: Esta é uma implementação insegura para fins de demonstração
-        # Em um sistema real, você deve usar uma biblioteca segura para avaliar expressões
-        # como sympy ou uma API de cálculo dedicada
-        return eval(expression)
+        # Search
+        search_docs = WikipediaLoader(query=question, load_max_docs=1).load()
+        
+        # Format
+        formatted_search_docs = "\n\n---\n\n".join(
+            [
+                f'<Document source="{doc.metadata["source"]}" page="{doc.metadata.get("page", "")}"/>\n{doc.page_content}\n</Document>'
+                for doc in search_docs
+            ]
+        )
+        logging.info(f"Wikipedia search results: {formatted_search_docs}")
+        return {"context": [formatted_search_docs]}
     except Exception as e:
-        logging.error(f"Error in calculation: {str(e)}")
-        return 0.0
-
-
-def web_search(query: str) -> List[Dict[str, Any]]:
-    """
-    Realiza uma pesquisa na web
-    
-    Args:
-        query: Consulta de pesquisa
-    
-    Returns:
-        Lista de resultados da pesquisa
-    """
-    logging.info(f"Web searching for: {query}")
-    
-    # Implementação de exemplo - em um sistema real, isso se conectaria a uma API de pesquisa
-    return [
-        {
-            "title": "Resultado de pesquisa simulado",
-            "snippet": "Este é um snippet de resultado de pesquisa simulado.",
-            "url": "https://example.com/result"
-        }
-    ]
+        logging.warning(f"Wikipedia search failed: {str(e)}")
+        return {"context": ["No relevant Wikipedia results found."]}

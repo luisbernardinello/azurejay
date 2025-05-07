@@ -1,15 +1,15 @@
 from pydantic import BaseModel, Field
 from uuid import UUID
-from typing import List, Dict, Any, Optional
-
+from typing import List, Dict, Any, Optional, Literal, Annotated
+from typing_extensions import TypedDict
+import operator
 
 class UserProfileMemory(BaseModel):
     """Profile of a user that's extracted and maintained by the agent"""
     user_name: str = Field(description="The user's preferred name")
-    user_location: str = Field(description="The user's location") 
+    user_location: str = Field(description="The user's location")
     user_interests: List[str] = Field(description="A list of the user's interests", default_factory=list)
-    
-    
+
 class AgentConfig(BaseModel):
     """Configuration for the agent"""
     user_id: UUID
@@ -17,20 +17,30 @@ class AgentConfig(BaseModel):
     model_name: str = "gemini-1.5-flash"
     temperature: float = 0
 
-
 class AgentRequest(BaseModel):
     """Request to process a message with the agent"""
     message: str
-
 
 class AgentResponse(BaseModel):
     """Response from the agent"""
     message: str
     updated_memory: Optional[UserProfileMemory] = None
 
-
 class AgentMemoryResponse(BaseModel):
     """Response containing the agent's memory for a user"""
     user_id: UUID
     memory: Optional[UserProfileMemory] = None
-    
+
+# Added from service.py
+class EnhancedState(TypedDict):
+    """Enhanced state that includes context for search results and routing information"""
+    messages: list
+    question: str
+    answer: str
+    memory: Dict[str, Any]
+    context: Annotated[list, operator.add]
+    search_needed: bool  # Track if search is needed
+
+class RouteDecision(TypedDict):
+    """Decision on what route to take in the agent graph"""
+    route: Literal['search', 'direct_answer', 'memory_update']
