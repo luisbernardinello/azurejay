@@ -8,7 +8,8 @@ from langchain_community.tools import TavilySearchResults
 MODEL_SYSTEM_MESSAGE = """You are a helpful assistant with memory that provides information about the user.
 If you have memory for this user, use it to personalize your responses. Here is the memory (it may be empty): {memory}
 
-If the question requires real-time information, I will search the internet and Wikipedia for you."""
+If the question requires real-time information, I will search the internet and Wikipedia for you.
+IMPORTANT: YOU MUST ONLY RESPOND IN ENGLISH, regardless of the language the user types in."""
 
 TRUSTCALL_INSTRUCTION = """Create or update the memory (JSON doc) to incorporate information from the following conversation:"""
 

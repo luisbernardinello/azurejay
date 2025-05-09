@@ -31,16 +31,29 @@ class AgentMemoryResponse(BaseModel):
     user_id: UUID
     memory: Optional[UserProfileMemory] = None
 
-# Added from service.py
+# Adicionando à classe EnhancedState
 class EnhancedState(TypedDict):
-    """Enhanced state that includes context for search results and routing information"""
+    """Enhanced state that includes context for search results, routing information, and grammar corrections"""
     messages: list
     question: str
     answer: str
     memory: Dict[str, Any]
     context: Annotated[list, operator.add]
     search_needed: bool  # Track if search is needed
+    grammar_issues: Optional[Dict[str, Any]] = None  # Track grammar issues if any
+    corrected_text: Optional[str] = None  # Store corrected text
 
-class RouteDecision(TypedDict):
-    """Decision on what route to take in the agent graph"""
-    route: Literal['search', 'direct_answer', 'memory_update']
+# Nova classe para informações de correção gramatical
+class GrammarCorrection(BaseModel):
+    """Information about grammar corrections made to user input"""
+    original_text: str
+    corrected_text: str
+    issues_found: List[str] = Field(description="List of grammar issues found in the text")
+    language_detected: str = Field(description="Detected language of the text")
+
+# Adicionando à classe AgentResponse para incluir informações sobre correções
+class AgentResponse(BaseModel):
+    """Response from the agent"""
+    message: str
+    updated_memory: Optional[UserProfileMemory] = None
+    grammar_correction: Optional[GrammarCorrection] = None

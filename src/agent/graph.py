@@ -13,13 +13,14 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from . import models
 from . import configuration
 from . import utils
-from . import tools
+from . import search
+from . import grammar
 from ..users.service import get_user_by_name
 from trustcall import create_extractor
 
-def route_message(state: models.EnhancedState) -> Literal["search_web", "generate_response"]:
+def route_message(state: models.EnhancedState) -> Literal["search_web", "generate_response", "grammar_correction"]:
     """
-    Conditional routing function to determine whether to search or directly answer.
+    Conditional routing function to determine whether to search, correct grammar, or directly answer.
     """
     # Extract the last user message
     last_message = state["messages"][-1]
@@ -28,7 +29,18 @@ def route_message(state: models.EnhancedState) -> Literal["search_web", "generat
         
     query = last_message.content.lower()
     
-    # Check if query likely needs external information
+    # First check if grammar correction or language detection is needed
+    if grammar.needs_grammar_correction(last_message.content):
+        # Check the language
+        language = grammar.detect_language(last_message.content)
+        if language != 'en' and language != 'unknown':
+            logging.info(f"Non-English language detected: {language}. Routing to grammar_correction.")
+            return "grammar_correction"
+        elif grammar.check_grammar(last_message.content)[0]:  # If there are grammar issues
+            logging.info(f"Grammar issues detected. Routing to grammar_correction.")
+            return "grammar_correction"
+    
+    # Then check if search is needed
     search_indicators = [
         "what is", "who is", "when did", "where is", "how does", 
         "latest", "recent", "news", "information about",
@@ -67,6 +79,9 @@ def generate_response(state: models.EnhancedState, config: RunnableConfig, compo
     
     # Format the memory in the system prompt
     system_msg = utils.MODEL_SYSTEM_MESSAGE.format(memory=formatted_memory)
+    
+    # Add language instruction to ensure English responses
+    system_msg += "\nIMPORTANT: You should ONLY respond in English, even if the user writes in another language."
     
     # Add context from search results if available
     context = state.get("context", [])
@@ -133,10 +148,20 @@ def create_agent_graph(components: dict, redis_client: redis.Redis, db: Session)
         return write_memory(state, config, redis_client)
     
     def search_web_node(state, config):
-        return tools.search_web(state, config)
+        return search.search_web(state, config)
     
     def search_wikipedia_node(state, config):
-        return tools.search_wikipedia(state, config)
+        return search.search_wikipedia(state, config)
+    
+    def grammar_correction_node(state, config):
+        # First process grammar to detect issues
+        grammar_state = grammar.process_grammar(state)
+        
+        # Update the state with grammar information
+        updated_state = {**state, **grammar_state}
+        
+        # Generate a response about grammar issues
+        return grammar.generate_grammar_response(updated_state, config, components)
     
     # Create the graph
     builder = StateGraph(models.EnhancedState)
@@ -146,12 +171,16 @@ def create_agent_graph(components: dict, redis_client: redis.Redis, db: Session)
     builder.add_node("write_memory", write_memory_with_deps)
     builder.add_node("search_web", search_web_node)
     builder.add_node("search_wikipedia", search_wikipedia_node)
+    builder.add_node("grammar_correction", grammar_correction_node)
     
     # Define the starting edge using route_message to determine flow
     builder.add_conditional_edges(
         START,
         route_message  # Use the route_message function to decide the first node
     )
+    
+    # Grammar correction leads to memory writing
+    builder.add_edge("grammar_correction", "write_memory")
     
     # Search web leads to Wikipedia search
     builder.add_edge("search_web", "search_wikipedia")

@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from . import models
 from . import utils
 from . import graph
+from . import grammar
 from ..conversations import service as conversation_service
 
 def process_message(
@@ -48,6 +49,10 @@ def process_message(
             # If conversation doesn't exist or there's an error, start with just the new message
             messages = []
         
+        # Do language detection early to log
+        lang = grammar.detect_language(message)
+        logging.info(f"Message language detected: {lang}")
+        
         # Add the current message
         messages.append(HumanMessage(content=message))
         
@@ -58,7 +63,9 @@ def process_message(
             answer="",
             memory={},
             context=[],
-            search_needed=False
+            search_needed=False,
+            grammar_issues=None,
+            corrected_text=None
         )
         
         # Run the graph
@@ -81,11 +88,17 @@ def process_message(
         memory_json = redis_client.get(memory_key)
         updated_memory = json.loads(memory_json) if memory_json else None
         
-        # Return the response
-        return models.AgentResponse(
+        # Create the response object
+        response = models.AgentResponse(
             message=last_message.content,
             updated_memory=models.UserProfileMemory(**updated_memory) if updated_memory else None
         )
+        
+        # Add grammar correction info if available
+        if "grammar_correction" in result:
+            response.grammar_correction = result["grammar_correction"]
+        
+        return response
     except Exception as e:
         logging.error(f"Error processing message through agent: {str(e)}")
         raise
