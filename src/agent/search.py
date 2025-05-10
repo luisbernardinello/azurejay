@@ -3,6 +3,8 @@ from langchain_core.runnables.config import RunnableConfig
 from langchain_community.tools import TavilySearchResults
 from langchain_community.document_loaders import WikipediaLoader
 from langchain_core.messages import HumanMessage
+from langchain_community.tools import DuckDuckGoSearchRun
+
 
 from .models import EnhancedState
 
