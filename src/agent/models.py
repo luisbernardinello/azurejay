@@ -21,17 +21,12 @@ class AgentRequest(BaseModel):
     """Request to process a message with the agent"""
     message: str
 
-class AgentResponse(BaseModel):
-    """Response from the agent"""
-    message: str
-    updated_memory: Optional[UserProfileMemory] = None
-
 class AgentMemoryResponse(BaseModel):
     """Response containing the agent's memory for a user"""
     user_id: UUID
     memory: Optional[UserProfileMemory] = None
 
-# Adicionando à classe EnhancedState
+# Enhanced state definition in models.py
 class EnhancedState(TypedDict):
     """Enhanced state that includes context for search results, routing information, and grammar corrections"""
     messages: list
@@ -42,6 +37,7 @@ class EnhancedState(TypedDict):
     search_needed: bool  # Track if search is needed
     grammar_issues: Optional[Dict[str, Any]] = None  # Track grammar issues if any
     corrected_text: Optional[str] = None  # Store corrected text
+    contains_question: bool = False  # New field to track if the message contains a question
 
 # Nova classe para informações de correção gramatical
 class GrammarCorrection(BaseModel):

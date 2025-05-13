@@ -29,14 +29,10 @@ def route_message(state: models.EnhancedState) -> Literal["search_web", "generat
         
     query = last_message.content.lower()
     
-    # First check if grammar correction or language detection is needed
+    # First check if grammar correction is needed
     if grammar.needs_grammar_correction(last_message.content):
-        # Check the language
-        language = grammar.detect_language(last_message.content)
-        if language != 'en' and language != 'unknown':
-            logging.info(f"Non-English language detected: {language}. Routing to grammar_correction.")
-            return "grammar_correction"
-        elif grammar.check_grammar(last_message.content)[0]:  # If there are grammar issues
+
+        if grammar.check_grammar(last_message.content)[0]:  # If there are grammar issues
             logging.info(f"Grammar issues detected. Routing to grammar_correction.")
             return "grammar_correction"
     

@@ -52,6 +52,12 @@ def process_message(
         # Do language detection early to log
         lang = grammar.detect_language(message)
         logging.info(f"Message language detected: {lang}")
+        if lang != 'en':
+            response = models.AgentResponse(
+                message="Language detection indicates non-English. Please use English.",
+                updated_memory=None
+            )
+            return response
         
         # Add the current message
         messages.append(HumanMessage(content=message))
