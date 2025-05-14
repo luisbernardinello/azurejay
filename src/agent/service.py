@@ -77,11 +77,11 @@ def process_message(
                     
                     if sorted_corrections:
                         latest = sorted_corrections[0]
-                        response.grammar_correction = {
-                            "original_text": latest.get("original_text", ""),
-                            "corrected_text": latest.get("corrected_text", ""),
-                            "explanation": latest.get("explanation", "")
-                        }
+                        response.grammar_correction = models.GrammarCorrectionResponse(
+                            original_text=latest.get("original_text", ""),
+                            corrected_text=latest.get("corrected_text", ""),
+                            explanation=latest.get("explanation", "")
+                        )
                 
                 return response
                 

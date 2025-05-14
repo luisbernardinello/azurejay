@@ -112,3 +112,5 @@ class AgentMemoryResponse(BaseModel):
     """
     user_id: UUID = Field(description="User ID")
     memory: Optional[UserProfileMemory] = Field(default=None, description="User profile memory")
+    
+    
