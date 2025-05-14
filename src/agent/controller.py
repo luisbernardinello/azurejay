@@ -1,6 +1,5 @@
 from fastapi import APIRouter, status, HTTPException, Depends, BackgroundTasks
 from uuid import UUID
-from typing import List
 from sqlalchemy.orm import Session
 
 from src.database.core import RedisClient, get_db
@@ -36,10 +35,10 @@ async def process_message(
             conversation_service.create_conversation(
                 redis_client,
                 current_user.get_uuid(),
-                conversation_service.models.ConversationCreate(title="AI Assistant Chat")
+                conversation_service.models.ConversationCreate(title="English Tutor Chat")
             )
         
-        # Process the message through the agent (this can be slow, consider moving to background)
+        # Process the message through the agent
         response = service.process_message(
             redis_client,
             db,

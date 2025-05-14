@@ -1,5 +1,5 @@
 fastapi==0.115.12
-langchain_community==0.3.23
+langchain_community==0.3.24
 langchain_core==0.3.59
 langchain_google_genai==2.1.4
 langchain-groq==0.3.2
@@ -23,3 +23,4 @@ psycopg2-binary==2.9.9
 email-validator==2.1.0
 wikipedia==1.4.0
 pyspellchecker==0.8.2
+langgraph-checkpoint-redis==0.0.5

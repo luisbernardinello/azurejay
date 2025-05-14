@@ -63,7 +63,7 @@ AzureJay offers a Voice-Powered App with these key features:
 - 🧠 **MRKL Architecture**: Hybrid neuro-symbolic system combining neural networks with symbolic reasoning for more accurate explanations
 - 🎯 **Personalized Learning**: Adapts to your interests
 - 📊 **Progress Tracking**: Monitor your improvement over time with detailed analytics
-- 🌐 **Multi-Language Support**: Initially supporting English and Portuguese, with more languages planned
+- 🌐 **Multi-Language Support**: Initially supporting English, with more languages planned
 
 ## MRKL Architecture
 
@@ -72,27 +72,22 @@ AzureJay offers a Voice-Powered App with these key features:
 AzureJay is built on the MRKL (Modular Reasoning, Knowledge, and Language) architecture, a cutting-edge neuro-symbolic approach that combines the strengths of neural networks with symbolic reasoning systems:
 
 ```
-┌───────────────────┐
-│  User Input       │
-│  (Text/Voice)     │
-└─────────┬─────────┘
-          │
-┌─────────▼──────────┐
-│ Intelligent Router │
-└─────────┬──────────┘
-          │
-┌─────────▼─────────┐      ┌─────────────────────┐      ┌───────────────────┐
-│ MRKL Modules      │◄────►│ Knowledge Retrieval │◄────►│ Language Models   │
-└─────────┬─────────┘      └─────────────────────┘      └───────────────────┘
-          │
-┌─────────▼─────────┐
-│ Response          │
-│ Orchestrator      │
-└─────────┬─────────┘
-          │
-┌─────────▼─────────┐
-│ User Response     │
-└───────────────────┘
+                                                      +-----------+
+                                                      | __start__ |
+                                                      +-----------+
+                                                             *
+                                                             *
+                                                             *
+                                                  +-------------------+
+                                               ...| ai_language_tutor |....
+                                     ..........  *+-------------------+.   .........
+                          ...........       *****            *          .....       ..........
+                ..........             *****                *                ....             .........
+          ......                    ***                     *                    ...                   .....
++---------+           +----------------+           +----------------+           +--------------+           +----------------+
+| __end__ |           | update_grammar |           | update_profile |           | update_topic |           | web_search_api |
++---------+           +----------------+           +----------------+           +--------------+           +----------------+
+
 ```
 
 ### Getting Started

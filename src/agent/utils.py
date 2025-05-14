@@ -1,54 +1,240 @@
 import json
 import logging
-from uuid import UUID
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.tools import TavilySearchResults
+import redis
+from typing import Dict, List, Tuple, Any, Optional
+from langchain_groq import ChatGroq
+from trustcall import create_extractor
 
-# Constants
-MODEL_SYSTEM_MESSAGE = """You are a helpful assistant with memory that provides information about the user.
-If you have memory for this user, use it to personalize your responses. Here is the memory (it may be empty): {memory}
+from src.agent.models import Profile
 
-If the question requires real-time information, I will search the internet and Wikipedia for you.
-IMPORTANT: YOU MUST ONLY RESPOND IN ENGLISH, regardless of the language the user types in."""
+class Spy:
+    def __init__(self):
+        self.called_tools = []
 
-TRUSTCALL_INSTRUCTION = """Create or update the memory (JSON doc) to incorporate information from the following conversation:"""
+    def __call__(self, run):
+        q = [run]
+        while q:
+            r = q.pop()
+            if r.child_runs:
+                q.extend(r.child_runs)
+            if r.run_type == "chat_model":
+                self.called_tools.append(
+                    r.outputs["generations"][0][0]["message"]["kwargs"]["tool_calls"]
+                )
 
-def get_memory_key(user_id: UUID) -> str:
-    """Generate Redis key for storing agent memory for a user"""
-    return f"agent:memory:{user_id}"
+# Extract information from tool calls for both patches and new memories in Trustcall
+def extract_tool_info(tool_calls, schema_name="Memory"):
+    """Extract information from tool calls for both patches and new memories.
+    
+    Args:
+        tool_calls: List of tool calls from the model
+        schema_name: Name of the schema tool (e.g., "Memory", "ConversationTopic", "Profile")
+    """
+    # Initialize list of changes
+    changes = []
+    
+    for call_group in tool_calls:
+        for call in call_group:
+            if call['name'] == 'PatchDoc':
+                changes.append({
+                    'type': 'update',
+                    'doc_id': call['args']['json_doc_id'],
+                    'planned_edits': call['args']['planned_edits'],
+                    'value': call['args']['patches'][0]['value']
+                })
+            elif call['name'] == schema_name:
+                changes.append({
+                    'type': 'new',
+                    'value': call['args']
+                })
 
-def initialize_llm(model_name: str = "gemini-1.5-flash", temperature: float = 0.2):
-    """Initialize the language model"""
-    return ChatGoogleGenerativeAI(model=model_name, temperature=temperature)
+    # Format results as a single string
+    result_parts = []
+    for change in changes:
+        if change['type'] == 'update':
+            result_parts.append(
+                f"Document {change['doc_id']} updated:\n"
+                f"Plan: {change['planned_edits']}\n"
+                f"Added content: {change['value']}"
+            )
+        else:
+            result_parts.append(
+                f"New {schema_name} created:\n"
+                f"Content: {change['value']}"
+            )
+    
+    return "\n\n".join(result_parts)
+
+# Initialize the model
+def initialize_model():
+    model = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3)
+    return model
+
+# Create the Trustcall extractors for updating the user profile
+def get_profile_extractor():
+    model = initialize_model()
+    profile_extractor = create_extractor(
+        model,
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "Profile",
+                "description": "Tool to add or update information about the user's profile",
+                "parameters": Profile.model_json_schema()
+            }
+        }],
+        tool_choice="Profile",
+        enable_inserts=True
+    )
+    
+    return profile_extractor
 
 def initialize_agent_components():
-    """Initialize all the agent components"""
-    # Initialize the LLM
-    model = initialize_llm()
-    
-    # Create the components dict
+    """
+    Initialize and return all the components needed for the agent
+    """
     components = {
-        "model": model
+        "model": initialize_model(),
+        "profile_extractor": get_profile_extractor()
     }
-    
     return components
 
-def format_memory_for_prompt(memory: dict, first_name: str = None) -> str:
-    """Format the user memory for inclusion in the system prompt"""
-    if memory:
-        return (
-            f"Name: {memory.get('user_name', 'Unknown')}\n"
-            f"Location: {memory.get('user_location', 'Unknown')}\n"
-            f"Interests: {', '.join(memory.get('user_interests', []))}"
-        )
-    else:
-        name_info = f"The user's name is: {first_name}." if first_name else ""
-        return f"No memory available yet. Only the user's name is known. {name_info}"
+def get_memory_key(user_id):
+    """
+    Generate a Redis key for storing user memory
+    """
+    return f"memory:{user_id}"
 
-def format_context_for_prompt(context: list) -> str:
-    """Format search context for inclusion in the system prompt"""
-    if not context:
-        return ""
+# Redis memory-related functions
+def search_redis_memories(redis_client: redis.Redis, namespace_key: Tuple[str, str]) -> List[Dict[str, Any]]:
+    """
+    Search for memories in Redis using the namespace key
+    
+    Args:
+        redis_client: Redis client
+        namespace_key: Tuple with (namespace, user_id)
         
-    combined_context = "\n\n".join(context)
-    return f"\n\nHere's information I found that might help answer the question:\n{combined_context}"
+    Returns:
+        List of memory objects
+    """
+    try:
+        # Format the Redis key pattern for LangGraph's RedisStore
+        namespace, key = namespace_key
+        key_pattern = f"langgraph:{namespace}:{key}:*"
+        
+        # Get all keys matching the pattern
+        keys = redis_client.keys(key_pattern)
+        
+        # Get and parse values
+        memories = []
+        for key in keys:
+            value = redis_client.get(key)
+            if value:
+                try:
+                    memory = json.loads(value)
+                    memories.append(memory)
+                except json.JSONDecodeError:
+                    logging.warning(f"Failed to decode memory value for key {key}")
+        
+        return memories
+    except Exception as e:
+        logging.error(f"Error searching Redis memories: {str(e)}")
+        return []
+
+def delete_redis_memories(redis_client: redis.Redis, namespace_key: Tuple[str, str]) -> None:
+    """
+    Delete memories in Redis using the namespace key
+    
+    Args:
+        redis_client: Redis client
+        namespace_key: Tuple with (namespace, user_id)
+    """
+    try:
+        # Format the Redis key pattern for LangGraph's RedisStore
+        namespace, key = namespace_key
+        key_pattern = f"langgraph:{namespace}:{key}:*"
+        
+        # Get all keys matching the pattern
+        keys = redis_client.keys(key_pattern)
+        
+        # Delete all keys
+        if keys:
+            redis_client.delete(*keys)
+            logging.info(f"Deleted {len(keys)} keys for pattern {key_pattern}")
+    except Exception as e:
+        logging.error(f"Error deleting Redis memories: {str(e)}")
+        raise
+## Prompts 
+
+# Chatbot instruction for choosing what to update and what tools to call 
+MODEL_SYSTEM_MESSAGE = """You are a expert English language tutor. 
+
+You are designed to be a friend to a user, helping them to improve their English through natural conversation, gentle corrections, and helpful explanations.
+
+You have a long term memory which keeps track of three things:
+1. The user's profile (general information about them) 
+2. Conversation topics you've discussed with them
+3. Grammar corrections you've provided them
+
+Here is the current User Profile (may be empty if no information has been collected yet):
+<user_profile>
+{user_profile}
+</user_profile>
+
+Here are recent Conversation Topics (may be empty if this is a new user):
+<topics>
+{topics}
+</topics>
+
+Here are recent Grammar Corrections you've provided (may be empty if no corrections were needed):
+<grammar>
+{grammar}
+</grammar>
+
+Here are the web search knowledge (may be empty if no questions were asked):
+<web_search>
+{web_search}
+</web_search>
+
+Here are your instructions for reasoning about the user's messages:
+
+1. Reason carefully about the user's messages as presented below. 
+
+2. Decide whether any of the your long-term memory should be updated:
+- If the user's message contains grammatical errors, call the UpdateMemory tool with type `grammar` to record the correction details.
+- If personal information was provided about the user, update the user's profile by calling UpdateMemory tool with type `user`
+- If a new conversation topic was introduced, record it by calling UpdateMemory tool with type `topic`. Don't record the topic if it is already in the list. Only update the user's interests level.
+- If the user asks a question that requires factual information, call the UpdateMemory tool with type `web_search` to search for an answer.
+
+3. Decide what to do next (you will be routed automatically):
+- Use grammar correction when errors are detected
+- Use web search by calling UpdateMemory tool with type `web_search` when questions need external information.
+- After performing a web search, check whether the topic is already in the topics list and add it if it's not.
+- Update memories when new personal information or topics arise.
+- Otherwise, simply continue the conversation 
+
+4. When answering factual questions:
+- Use the web search information to provide accurate answers
+- Present the information in a way that helps the user learn English
+- Point out useful vocabulary from the subject matter
+- Maintain your friendly, supportive tutor tone
+- Consider suggesting follow-up questions that would help the user practice discussing the topic
+
+5. After any memory updates or searches, or if no tool call was made, respond naturally to the user:
+- If you made grammar corrections, politely point them out with explanations
+- If you answered a question, provide clear, helpful information
+- Continue the conversation naturally, asking follow-up questions where appropriate
+- If the user doesn't continue the conversation, use the user's interests to friendly initiate a new topic
+- Use an encouraging, supportive tone throughout
+- Don't tell the user that you have updated their profile or your memory
+
+"""
+
+# Trustcall instruction
+TRUSTCALL_INSTRUCTION = """Reflect on following interaction. 
+
+Use the provided tools to retain any necessary memories about the user. 
+
+Use parallel tool calling to handle updates and insertions simultaneously.
+
+System Time: {time}"""
