@@ -369,11 +369,8 @@ def route_message(state: MessagesState, config: RunnableConfig, store: BaseStore
         print(f"DEBUG: Erro ao processar route_message: {str(e)}")
         return END
     
-def setup_and_run_graph():
+def create_agent_graph(store: BaseStore) -> StateGraph:
     
-    # redis_uri = get_redis()
-    REDIS_URI = os.environ.get("REDIS_URL", "redis://redis:6379/0")
-    """Setup the graph and run a sample conversation"""
     # Create the graph + all nodes
     builder = StateGraph(MessagesState, config_schema=configuration.Configuration)
 
@@ -392,17 +389,6 @@ def setup_and_run_graph():
     builder.add_edge("update_grammar", "ai_language_tutor")
     builder.add_edge("web_search_api", "ai_language_tutor")
 
-    # Initialize Redis connections
-    with RedisSaver.from_conn_string(REDIS_URI) as checkpointer:
-        # Setup indices
-        checkpointer.setup()
-        
-        with RedisStore.from_conn_string(REDIS_URI) as store:
-            # Setup store indices
-            store.setup()
-            
-            # Compile the graph with Redis persistence
-            graph = builder.compile(checkpointer=checkpointer, store=store)
-            
-            
-            return graph
+    graph = builder.compile(store=store)
+    
+    return graph

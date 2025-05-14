@@ -4,11 +4,16 @@ from uuid import UUID
 import redis
 from sqlalchemy.orm import Session
 from langchain_core.messages import HumanMessage, AIMessage
-
+from langgraph.store.redis import RedisStore, AsyncRedisStore
+from langgraph.checkpoint.redis import RedisSaver, AsyncRedisSaver
 from . import models
 from . import utils
 from . import graph
 from ..conversations import service as conversation_service
+
+def get_memory_key(user_id: UUID) -> str:
+    """Generate a key for storing user memory in Redis"""
+    return f"user_memory:{user_id}"
 
 def process_message(
     redis_client: redis.Redis,
@@ -21,138 +26,157 @@ def process_message(
     Process a user message through the agent graph
     """
     try:
-        # Setup and retrieve the agent graph
-        agent_graph = graph.setup_and_run_graph()
+        # Initialize a Redis connection for LangGraph
+        redis_uri = f"redis://{redis_client.connection_pool.connection_kwargs.get('host', 'localhost')}:{redis_client.connection_pool.connection_kwargs.get('port', 6379)}/0"
         
-        # Create the config
-        config = {
-            "configurable": {
-                "user_id": str(user_id),
-                "thread_id": str(conversation_id)
-            }
-        }
-        
-        # Get existing conversation messages from Redis
-        try:
-            conv_detail = conversation_service.get_conversation(redis_client, user_id, conversation_id)
-            messages = []
-            for msg in conv_detail.messages:
-                if msg.is_user:
-                    messages.append(HumanMessage(content=msg.content))
-                else:
-                    messages.append(AIMessage(content=msg.content))
-        except Exception as e:
-            logging.info(f"Starting new conversation: {str(e)}")
-            # If conversation doesn't exist or there's an error, start with just the new message
-            messages = []
-        
-        # Add the current message
-        messages.append(HumanMessage(content=message))
-        
-        # Run the graph with the current conversation state
-        response_chunks = []
-        for chunk in agent_graph.stream({"messages": messages}, config, stream_mode="values"):
-            response_chunks.append(chunk)
-        
-        # Get the last message (assistant's response)
-        if response_chunks and "messages" in response_chunks[-1]:
-            last_message = response_chunks[-1]["messages"][-1]
-            assistant_response = last_message.content
-        else:
-            logging.error("No response received from agent graph")
-            assistant_response = "I apologize, but I couldn't process your message right now."
-        
-        # Store the user message in the conversation
-        message_request = conversation_service.models.MessageRequest(content=message)
-        conversation_service.add_message(redis_client, user_id, conversation_id, message_request, is_user=True)
-        
-        # Store the AI response in the conversation
-        ai_message_request = conversation_service.models.MessageRequest(content=assistant_response)
-        conversation_service.add_message(redis_client, user_id, conversation_id, ai_message_request, is_user=False)
-        
-        # Get the user memory
-        user_memory = get_user_memory(redis_client, user_id)
-        
-        # Create the response object
-        response = models.AgentResponse(
-            message=assistant_response,
-            updated_memory=user_memory.memory
-        )
-        
-        return response
+        # Setup LangGraph components
+        with RedisSaver.from_conn_string(redis_uri) as checkpointer:
+            checkpointer.setup()
+            
+            with RedisStore.from_conn_string(redis_uri) as store:
+                store.setup()
+                
+                # Create the graph
+                agent_graph = graph.create_agent_graph(store)
+                
+                # Create the config for the graph
+                config = {
+                    "configurable": {
+                        "user_id": str(user_id),
+                    }
+                }
+                
+                # Create the input state with the user message
+                input_messages = [HumanMessage(content=message)]
+                
+                # Run the graph
+                result = agent_graph.invoke({"messages": input_messages}, config)
+                
+                # Extract the response (last message)
+                last_message = result["messages"][-1]
+                response_content = last_message.content if hasattr(last_message, 'content') else str(last_message)
+                
+                # Create the response object
+                response = models.AgentResponse(
+                    message=response_content,
+                    updated_memory=None  # We'll populate this in get_user_memory
+                )
+                
+                # Check if there's grammar correction info
+                namespace = ("grammar", str(user_id))
+                grammar_memories = store.search(namespace)
+                
+                if grammar_memories:
+                    # Sort by timestamp to get the most recent correction
+                    corrections = [mem.value for mem in grammar_memories]
+                    sorted_corrections = sorted(
+                        corrections, 
+                        key=lambda x: x.get('timestamp', ''), 
+                        reverse=True
+                    )
+                    
+                    if sorted_corrections:
+                        latest = sorted_corrections[0]
+                        response.grammar_correction = {
+                            "original_text": latest.get("original_text", ""),
+                            "corrected_text": latest.get("corrected_text", ""),
+                            "explanation": latest.get("explanation", "")
+                        }
+                
+                return response
+                
     except Exception as e:
-        logging.error(f"Error processing message through agent: {str(e)}")
+        logging.error(f"Error processing message through agent: {str(e)}", exc_info=True)
         raise
 
 def get_user_memory(redis_client: redis.Redis, user_id: UUID) -> models.AgentMemoryResponse:
     """
-    Get the agent's memory for a user by aggregating all memory types
+    Get the agent's memory for a user
     """
     try:
-        memory_data = {
-            "profile": None,
-            "topics": [],
-            "grammar_corrections": [],
-            "web_search": None
-        }
+        # Initialize a Redis connection for LangGraph
+        redis_uri = f"redis://{redis_client.connection_pool.connection_kwargs.get('host', 'localhost')}:{redis_client.connection_pool.connection_kwargs.get('port', 6379)}/0"
         
-        # Convert user_id to string for Redis store
-        user_id_str = str(user_id)
-        
-        # Try to get profile memory
-        profile_key = ("profile", user_id_str)
-        profile_memories = utils.search_redis_memories(redis_client, profile_key)
-        if profile_memories and len(profile_memories) > 0:
-            memory_data["profile"] = profile_memories[0]
-        
-        # Get topic memories
-        topic_key = ("topic", user_id_str)
-        topic_memories = utils.search_redis_memories(redis_client, topic_key)
-        if topic_memories:
-            memory_data["topics"] = topic_memories
-        
-        # Get grammar correction memories
-        grammar_key = ("grammar", user_id_str)
-        grammar_memories = utils.search_redis_memories(redis_client, grammar_key)
-        if grammar_memories:
-            memory_data["grammar_corrections"] = grammar_memories
-        
-        # Get web search memories
-        web_search_key = ("web_search", user_id_str)
-        web_search_memories = utils.search_redis_memories(redis_client, web_search_key)
-        if web_search_memories and len(web_search_memories) > 0:
-            memory_data["web_search"] = web_search_memories[0]
-        
-        # Create UserProfileMemory object
-        user_profile_memory = models.UserProfileMemory(
-            profile=memory_data["profile"],
-            topics=memory_data["topics"],
-            grammar_corrections=memory_data["grammar_corrections"],
-            web_search=memory_data["web_search"]
-        )
-        
-        return models.AgentMemoryResponse(
-            user_id=user_id,
-            memory=user_profile_memory
-        )
+        # Setup LangGraph components
+        with RedisSaver.from_conn_string(redis_uri) as checkpointer:
+            # Retrieve memory components from Redis store
+            with RedisStore.from_conn_string(redis_uri) as store:
+                
+                profile_data = None
+                topics_data = []
+                grammar_data = []
+                web_search_data = {}
+                
+                # Get profile memory
+                profile_memories = store.search(("profile", str(user_id)))
+                if profile_memories:
+                    profile_data = profile_memories[0].value
+                
+                # Get topics memory
+                topic_memories = store.search(("topic", str(user_id)))
+                if topic_memories:
+                    topics_data = [mem.value for mem in topic_memories]
+                
+                # Get grammar memory
+                grammar_memories = store.search(("grammar", str(user_id)))
+                if grammar_memories:
+                    grammar_data = [mem.value for mem in grammar_memories]
+                
+                # Get web search memory
+                web_search_memories = store.search(("web_search", str(user_id)))
+                if web_search_memories:
+                    web_search_data = web_search_memories[0].value
+                
+                # Create a UserProfileMemory object
+                memory = models.UserProfileMemory(
+                    profile=profile_data,
+                    topics=topics_data,
+                    grammar_corrections=grammar_data,
+                    web_search=web_search_data
+                )
+                
+                return models.AgentMemoryResponse(
+                    user_id=user_id,
+                    memory=memory
+                )
     except Exception as e:
-        logging.error(f"Error retrieving memory for user {user_id}: {str(e)}")
+        logging.error(f"Error retrieving memory for user {user_id}: {str(e)}", exc_info=True)
         raise
 
 def reset_user_memory(redis_client: redis.Redis, user_id: UUID) -> None:
     """
-    Reset (delete) all agent memory types for a user
+    Reset (delete) the agent's memory for a user
     """
     try:
-        user_id_str = str(user_id)
+        # Initialize a Redis connection for LangGraph
+        redis_uri = f"redis://{redis_client.connection_pool.connection_kwargs.get('host', 'localhost')}:{redis_client.connection_pool.connection_kwargs.get('port', 6379)}/0"
         
-        # Delete all memory types
-        memory_types = ["profile", "topic", "grammar", "web_search"]
-        for memory_type in memory_types:
-            key = (memory_type, user_id_str)
-            utils.delete_redis_memories(redis_client, key)
-        
-        logging.info(f"All memory types reset for user {user_id}")
+        # Setup LangGraph components
+        with RedisSaver.from_conn_string(redis_uri) as checkpointer:
+            
+            with RedisStore.from_conn_string(redis_uri) as store:
+
+                # Delete profile memory
+                profile_memories = store.search(("profile", str(user_id)))
+                for mem in profile_memories:
+                    store.delete(("profile", str(user_id)), mem.key)
+                    
+                # Delete topic memory
+                topic_memories = store.search(("topic", str(user_id)))
+                for mem in topic_memories:
+                    store.delete(("topic", str(user_id)), mem.key)
+                    
+                # Delete grammar memory
+                grammar_memories = store.search(("grammar", str(user_id)))
+                for mem in grammar_memories:
+                    store.delete(("grammar", str(user_id)), mem.key)
+                    
+                # Delete web search memory
+                web_search_memories = store.search(("web_search", str(user_id)))
+                for mem in web_search_memories:
+                    store.delete(("web_search", str(user_id)), mem.key)
+                
+        logging.info(f"Memory reset for user {user_id}")
     except Exception as e:
-        logging.error(f"Error resetting memory for user {user_id}: {str(e)}")
+        logging.error(f"Error resetting memory for user {user_id}: {str(e)}", exc_info=True)
         raise

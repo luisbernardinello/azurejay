@@ -1,5 +1,6 @@
 from fastapi import APIRouter, status, HTTPException, Depends, BackgroundTasks
 from uuid import UUID
+from typing import List
 from sqlalchemy.orm import Session
 
 from src.database.core import RedisClient, get_db
@@ -24,7 +25,7 @@ async def process_message(
     db: Session = Depends(get_db)
 ):
     """
-    Process a message through the agent and store the conversation
+    Process a message through the English tutor agent and store the conversation
     """
     try:
         # Verify the conversation exists and belongs to the user
@@ -47,6 +48,14 @@ async def process_message(
             agent_request.message
         )
         
+        # Store the user message in the conversation
+        message_request = conversation_service.models.MessageRequest(content=agent_request.message)
+        conversation_service.add_message(redis_client, current_user.get_uuid(), conversation_id, message_request, is_user=True)
+        
+        # Store the AI response in the conversation
+        ai_message_request = conversation_service.models.MessageRequest(content=response.message)
+        conversation_service.add_message(redis_client, current_user.get_uuid(), conversation_id, ai_message_request, is_user=False)
+        
         return response
     except Exception as e:
         raise HTTPException(
@@ -61,7 +70,7 @@ async def get_memory(
     current_user: CurrentUser
 ):
     """
-    Get the agent's memory for the current user
+    Get the agent's memory for the current user, including profile, topics, grammar corrections, and web search results
     """
     try:
         memory = service.get_user_memory(redis_client, current_user.get_uuid())
@@ -79,7 +88,7 @@ async def reset_memory(
     current_user: CurrentUser
 ):
     """
-    Reset (delete) the agent's memory for the current user
+    Reset (delete) the agent's memory for the current user, including profile, topics, grammar corrections, and web search results
     """
     try:
         service.reset_user_memory(redis_client, current_user.get_uuid())
@@ -87,4 +96,42 @@ async def reset_memory(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to reset memory: {str(e)}"
+        )
+
+
+@router.get("/grammar", response_model=List[models.GrammarCorrection])
+async def get_grammar_corrections(
+    redis_client: RedisClient,
+    current_user: CurrentUser
+):
+    """
+    Get all grammar corrections for the current user
+    """
+    try:
+        memory = service.get_user_memory(redis_client, current_user.get_uuid())
+        grammar_corrections = memory.memory.grammar_corrections if memory.memory else []
+        return grammar_corrections
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get grammar corrections: {str(e)}"
+        )
+
+
+@router.get("/topics", response_model=List[models.ConversationTopic])
+async def get_topics(
+    redis_client: RedisClient,
+    current_user: CurrentUser
+):
+    """
+    Get all conversation topics for the current user
+    """
+    try:
+        memory = service.get_user_memory(redis_client, current_user.get_uuid())
+        topics = memory.memory.topics if memory.memory else []
+        return topics
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get topics: {str(e)}"
         )

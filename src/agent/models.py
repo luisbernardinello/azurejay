@@ -46,13 +46,8 @@ class GrammarCorrection(BaseModel):
     explanation: str = Field(description="Explanation of the grammar rules and corrections", default=None)
     improvement: str = Field(description="Rewritten user's text in a native-like way", default=None)
     timestamp: datetime = Field(description="When this correction was made", default_factory=datetime.now)
-    
-# Tools
-class UpdateMemory(TypedDict):
-    """ Decision on what memory type to update """
-    update_type: Literal['profile', 'topic', 'grammar', 'web_search']
 
-# Search query tool
+# Search query schema
 class WebSearchKnowledge(BaseModel):
     """Knowledge gained from web search to answer user questions"""
     query: str = Field(description="The original search query from the user")
@@ -62,52 +57,58 @@ class WebSearchKnowledge(BaseModel):
         default=None
     )
     timestamp: datetime = Field(description="When this search was performed", default_factory=datetime.now)
-
-# Enhanced State for the agent
-class EnhancedState(BaseModel):
-    messages: List[Any]
-    question: str
-    answer: str
-    memory: Dict[str, Any] = Field(default_factory=dict)
-    context: List[str] = Field(default_factory=list)
-    search_needed: bool = False
-    grammar_issues: Optional[Dict[str, Any]] = None
-    corrected_text: Optional[str] = None
-
+    
+# Tools
+class UpdateMemory(TypedDict):
+    """ Decision on what memory type to update """
+    update_type: Literal['profile', 'topic', 'grammar', 'web_search']
 # ----------------------
 # API Models 
 # ----------------------
 
-# Agent Request model
-class AgentRequest(BaseModel):
-    """
-    Request model for the agent API
-    """
-    message: str
-
-# User Profile Memory model
+# User profile memory model
 class UserProfileMemory(BaseModel):
     """
-    Model for user profile memory
+    User profile memory for the agent, includes profile, topics, grammar corrections, and web search memory
     """
-    profile: Optional[Dict[str, Any]] = None
-    topics: List[Dict[str, Any]] = Field(default_factory=list)
-    grammar_corrections: List[Dict[str, Any]] = Field(default_factory=list)
-    web_search: Optional[Dict[str, Any]] = None
+    profile: Optional[Dict[str, Any]] = Field(default=None, description="User profile information")
+    topics: Optional[List[Dict[str, Any]]] = Field(default=None, description="Conversation topics")
+    grammar_corrections: Optional[List[Dict[str, Any]]] = Field(default=None, description="Grammar corrections")
+    web_search: Optional[Dict[str, Any]] = Field(default=None, description="Web search memory")
 
-# Agent Response model
+
+# Agent request model
+class AgentRequest(BaseModel):
+    """
+    Request to the agent for processing a message
+    """
+    message: str = Field(description="Message to process through the agent")
+
+
+# Grammar correction response structure
+class GrammarCorrectionResponse(BaseModel):
+    """
+    Grammar correction response structure for the agent
+    """
+    original_text: str = Field(description="Original text with errors")
+    corrected_text: str = Field(description="Corrected version of the text")
+    explanation: str = Field(description="Explanation of the grammar correction")
+
+
+# Agent response model
 class AgentResponse(BaseModel):
     """
-    Response model for the agent API
+    Response from the agent after processing a message
     """
-    message: str
-    updated_memory: Optional[UserProfileMemory] = None
-    grammar_correction: Optional[Dict[str, Any]] = None
+    message: str = Field(description="Response message from the agent")
+    updated_memory: Optional[UserProfileMemory] = Field(default=None, description="Updated memory after processing")
+    grammar_correction: Optional[GrammarCorrectionResponse] = Field(default=None, description="Grammar correction details if applicable")
 
-# Agent Memory Response model
+
+# Agent memory response model
 class AgentMemoryResponse(BaseModel):
     """
-    Response model for the agent memory API
+    Response containing the agent's memory for a user
     """
-    user_id: UUID
-    memory: Optional[UserProfileMemory] = None
+    user_id: UUID = Field(description="User ID")
+    memory: Optional[UserProfileMemory] = Field(default=None, description="User profile memory")
