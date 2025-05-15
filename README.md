@@ -63,7 +63,6 @@ AzureJay offers a Voice-Powered App with these key features:
 - 🧠 **MRKL Architecture**: Hybrid neuro-symbolic system combining neural networks with symbolic reasoning for more accurate explanations
 - 🎯 **Personalized Learning**: Adapts to your interests
 - 📊 **Progress Tracking**: Monitor your improvement over time with detailed analytics
-- 🌐 **Multi-Language Support**: Initially supporting English, with more languages planned
 
 ## MRKL Architecture
 
@@ -123,18 +122,14 @@ cd AzureJay
 - [x] 🏁 User profiling and personalization
 - [x] 🏁 Response orchestration system
 - [x] 🏁 Basic theme/branding
-- [x] 🏁 Initial language support for English and Portuguese
+- [x] 🏁 Initial language support for English
 - [ ] 🏁 KMP application development
 - [ ] 🏁 Enhanced pronunciation assessment
-- [ ] 🏁 Cultural context integration in conversations
-- [ ] 🏁 Spaced repetition based on conversation history
 
 ## Roadmap
 
-- [ ] Implement dialect recognition and support
-- [ ] Voice-assisted hands-free learning experience
-- [ ] Community features for peer language exchange
-- [ ] AR/VR immersive learning experiences
+- [ ] Cultural context integration in conversations
+- [ ] Spaced repetition based on conversation history
 
 ## Contribution
 
