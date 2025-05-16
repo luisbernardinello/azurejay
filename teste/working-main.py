@@ -1,70 +1,26 @@
 import uuid
 from datetime import datetime
 from pydantic import BaseModel, Field
+from typing import Annotated, Literal, Optional, TypedDict, List, Dict, Any, Sequence
 
 from trustcall import create_extractor
 
-from typing import Literal, Optional, TypedDict, List, Dict, Any
-
 from langchain_core.runnables import RunnableConfig
-from langchain_core.messages import merge_message_runs
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import merge_message_runs, BaseMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.output_parsers.openai_tools import PydanticToolsParser
 
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.graph import StateGraph, END
 from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
+from langgraph.graph.message import add_messages  # Helper function to add messages to the state
 from langchain_groq import ChatGroq
-# from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.document_loaders import WikipediaLoader
-from langchain_community.tools import TavilySearchResults
+
 
 import configuration
 from dotenv import load_dotenv
 load_dotenv(override=True)
-
-## Utilities 
-class Spy:
-    def __init__(self):
-        self.called_tools = []
-
-    def __call__(self, run):
-        q = [run]
-        while q:
-            r = q.pop()
-            if r.child_runs:
-                q.extend(r.child_runs)
-            if r.run_type == "chat_model":
-                self.called_tools.append(
-                    r.outputs["generations"][0][0]["message"]["kwargs"]["tool_calls"]
-                )
-
-def extract_tool_info(tool_calls, schema_name="Memory"):
-    """Extract information from tool calls for both patches and new memories."""
-    
-    # Initialize list of changes
-    changes = []
-    
-    for call_group in tool_calls:
-        for call in call_group:
-            if call['name'] == schema_name:
-                changes.append({
-                    'type': 'new',
-                    'value': call['args']
-                })
-
-    # Format results as a single string
-    result_parts = []
-    for change in changes:
-        result_parts.append(
-            f"New {schema_name} created:\n"
-            f"Content: {change['value']}"
-        )
-    
-    if not result_parts:
-        return ""
-    
-    return "\n\n".join(result_parts)
 
 ## Schema definitions
 
@@ -108,13 +64,7 @@ class GrammarCorrection(BaseModel):
     improvement: str = Field(description="Rewritten user's text in a native-like way")
     timestamp: datetime = Field(description="When this correction was made", default_factory=datetime.now)
     
-## Initialize the model and tools
-
-# Update memory tool
-class UpdateMemory(TypedDict):
-    """ Decision on what memory type to update """
-    update_type: Literal['user', 'topic', 'grammar']
-
+# Web Search Knowledge schema
 class WebSearchKnowledge(BaseModel):
     """Knowledge gained from web search to answer user questions"""
     query: str = Field(description="The original search query from the user")
@@ -125,103 +75,151 @@ class WebSearchKnowledge(BaseModel):
     )
     timestamp: datetime = Field(description="When this search was performed", default_factory=datetime.now)
 
+## ReAct State
+class TutorState(TypedDict):
+    """The state of the language tutor agent."""
+    messages: Annotated[Sequence[BaseMessage], add_messages]  # Using the add_messages helper
+    memory_updates: List[Dict[str, Any]]  # Track memory updates
+    step_count: int  # Track number of steps taken
+
+## Memory Tool Definitions
+class ProfileTool(BaseModel):
+    """Tool for updating the user's profile"""
+    name: Optional[str] = Field(description="The user's name", default=None)
+    location: Optional[str] = Field(description="The user's location", default=None)
+    job: Optional[str] = Field(description="The user's job", default=None)
+    connections: Optional[List[str]] = Field(
+        description="Personal connection of the user, such as family members, friends, or coworkers",
+        default=None
+    )
+    english_level: Optional[str] = Field(
+        description="The user's English proficiency level (e.g., beginner, intermediate, advanced)",
+        default=None
+    )
+    interests: Optional[List[str]] = Field(
+        description="Topics the user is interested in discussing in English", 
+        default=None
+    )
+
+class TopicTool(BaseModel):
+    """Tool for updating conversation topics"""
+    topic: str = Field(description="The main topic of conversation")
+    user_interest_level: str = Field(
+        description="How interested the user seemed in this topic (high, medium, low)"
+    )
+
+class GrammarTool(BaseModel):
+    """Tool for creating grammar corrections"""
+    original_text: str = Field(description="The user's original text with errors")
+    corrected_text: str = Field(description="The corrected version of the text")
+    explanation: str = Field(description="Explanation of the grammar rules and corrections")
+    improvement: str = Field(description="Rewritten user's text in a native-like way")
+
+## Initialize model and tools
 
 # Initialize the model
 model = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.2)
 
-## Create the Trustcall extractors for each memory type
-profile_extractor = create_extractor(
-    model,
-    tools=[Profile],
-    tool_choice="Profile",
-    enable_inserts=True
-)
+## Prompts
+MODEL_SYSTEM_MESSAGE = """You are an expert English language tutor. 
 
-topic_extractor = create_extractor(
-    model,
-    tools=[ConversationTopic],
-    tool_choice="ConversationTopic",
-    enable_inserts=True
-)
-
-grammar_extractor = create_extractor(
-    model,
-    tools=[GrammarCorrection],
-    tool_choice="GrammarCorrection",
-    enable_inserts=True
-)
-
-## Prompts 
-
-# Chatbot instruction for choosing what to update and what tools to call 
-MODEL_SYSTEM_MESSAGE = """You are a expert English language tutor. 
-
-You are designed to be a friend to a user, helping them to improve their English through natural conversation, gentle corrections, and helpful explanations.
-
-You have a long term memory which keeps track of three things:
-1. The user's profile (general information about them) 
-2. Conversation topics you've discussed with them
-3. Grammar corrections you've provided them
-
-Here is the current User Profile (may be empty if no information has been collected yet):
-<user_profile>
-{user_profile}
-</user_profile>
-
-Here are recent Conversation Topics (may be empty if this is a new user):
-<topics>
-{topics}
-</topics>
-
-Here are recent Grammar Corrections you've provided (may be empty if no corrections were needed):
-<corrections>
-{corrections}
-</corrections>
+You are designed to be a friend to a user, helping them to improve their English through natural conversation.
 
 Here are your instructions for reasoning about the user's messages:
 
-1. Reason carefully about the user's messages as presented below. 
+YOUR PRIMARY RESPONSIBILITY is to detect and correct grammar errors in the user's English. Then engage in friendly conversation.
 
-2. IMPORTANT: ALWAYS CHECK FOR GRAMMAR ERRORS FIRST. This is your primary job as a language tutor!
+1. WHENEVER the user writes a message with ANY grammar errors:
+- You MUST use the grammar_tool to record the error
+- You MUST explain the correction clearly in your response
+- You MUST offer an improved, more natural-sounding version
 
-3. Decide whether any of the your long-term memory should be updated:
-- If the user's message contains grammatical errors, ALWAYS call the UpdateMemory tool with type `grammar` to create a new record with the correction details.
-- If personal information was provided about the user, update the user's profile by calling UpdateMemory tool with type `user`
-- If a new conversation topic was introduced, record it by calling UpdateMemory tool with type `topic`. Don't record the topic if it is already in the list. Only update the user's interests level.
+2. GATHER USER INFORMATION STRATEGICALLY
+   - When the user shares personal details, use the profile_tool to update their profile
+   - Record conversation topics with the topic_tool when discussing new subjects
+   - Don't explicitly tell the user you're updating your records
 
-4. Decide what to do next (you will be routed automatically):
-- Use grammar correction when errors are detected
-- Update memories when new personal information or topics arise
-- Don't tell the user that you have updated their profile or your memory
-- Continue the conversation naturally, asking follow-up questions where appropriate
-- If the user doesn't continue the conversation, use the user's interests to friendly initiate a new topic
-   
-5. Use an encouraging, supportive tone throughout
+3. BE WARM AND CONVERSATIONAL
+   - Use an encouraging, supportive tone throughout
+   - Ask natural follow-up questions based on what you've learned about the user
+   - If the conversation stalls, bring up topics based on their interests
 
-6. Respond naturally to user user after a tool call was made to save memories, or if no tool call was made.
+You have access to three tools:
+1. profile_tool: Update or create user profile information
+2. topic_tool: Record conversation topics and user interest levels
+3. grammar_tool: Record grammar corrections with explanations
+
+Use these tools appropriately to provide the best language tutoring experience.
+
 
 """
 
-# Trustcall instruction
-TRUSTCALL_INSTRUCTION = """Reflect on following interaction. 
+## Tool Definitions
+from langchain_core.tools import Tool, tool
 
-Use the provided tools to retain any necessary memories about the user. 
+@tool
+def profile_tool(name: Optional[str] = None, location: Optional[str] = None, 
+                job: Optional[str] = None, connections: Optional[List[str]] = None,
+                english_level: Optional[str] = None, interests: Optional[List[str]] = None):
+    """Update the user's profile with any provided information.
+    
+    Args:
+        name: The user's name
+        location: The user's location 
+        job: The user's job
+        connections: Personal connections like family, friends, coworkers
+        english_level: English proficiency (beginner, intermediate, advanced)
+        interests: Topics the user likes discussing in English
+    """
+    profile_data = {
+        "name": name,
+        "location": location,
+        "job": job,
+        "connections": connections,
+        "english_level": english_level,
+        "interests": interests
+    }
+    # Filter out None values
+    profile_data = {k: v for k, v in profile_data.items() if v is not None}
+    return f"Updated user profile with: {profile_data}"
 
-Use parallel tool calling to handle updates and insertions simultaneously.
+@tool
+def topic_tool(topic: str, user_interest_level: str):
+    """Record a conversation topic and the user's interest level in it.
+    
+    Args:
+        topic: The main topic or subject of conversation
+        user_interest_level: How interested the user seemed (high, medium, low)
+    """
+    return f"Recorded topic '{topic}' with interest level: {user_interest_level}"
 
-System Time: {time}"""
+@tool
+def grammar_tool(original_text: str, corrected_text: str, explanation: str, improvement: str):
+    """Record a grammar correction with explanation.
+    
+    Args:
+        original_text: The user's original text with errors
+        corrected_text: The corrected version of the text
+        explanation: Explanation of the grammar rules and corrections
+        improvement: Rewritten user's text in a native-like way
+    """
+    return f"Recorded grammar correction:\nOriginal: {original_text}\nCorrected: {corrected_text}"
 
-## Node definitions
+tools = [profile_tool, topic_tool, grammar_tool]
 
-def ai_language_tutor(state: MessagesState, config: RunnableConfig, store: BaseStore):
+# Bind tools to the model
+model_with_tools = model.bind_tools(tools)
 
-    """Load memories from the store and use them to personalize the chatbot's response."""
+## Node functions for the ReAct pattern
+
+def call_model(state: TutorState, config: RunnableConfig, store: BaseStore):
+    """Node to call the language model with tools."""
     
     # Get the user ID from the config
     configurable = configuration.Configuration.from_runnable_config(config)
     user_id = configurable.user_id
 
-   # Retrieve profile memory from the store
+    # Retrieve profile memory from the store
     namespace = ("profile", user_id)
     memories = store.search(namespace)
     if memories:
@@ -238,248 +236,210 @@ def ai_language_tutor(state: MessagesState, config: RunnableConfig, store: BaseS
     namespace = ("grammar", user_id)
     memories = store.search(namespace)
     corrections = "\n".join(f"{mem.value}" for mem in memories)
-
     
-    system_msg = MODEL_SYSTEM_MESSAGE.format(user_profile=user_profile, topics=topics, corrections=corrections)
+    # Create a system message with memory context
+    system_msg = f"""{MODEL_SYSTEM_MESSAGE}
 
-    # Respond using memory as well as the chat history
-    response = model.bind_tools([UpdateMemory], parallel_tool_calls=True).invoke([SystemMessage(content=system_msg)]+state["messages"])
+Here is the current User Profile (may be empty if no information has been collected yet):
+<user_profile>
+{user_profile}
+</user_profile>
 
-    return {"messages": [response]}
+Here are recent Conversation Topics (may be empty if this is a new user):
+<topics>
+{topics}
+</topics>
 
-def update_profile(state: MessagesState, config: RunnableConfig, store: BaseStore):
-    """Reflect on the chat history and update the profile memory."""
+Here are recent Grammar Corrections you've provided (may be empty if no corrections were needed):
+<corrections>
+{corrections}
+</corrections>
+
+"""
+
+    # Increase step count
+    step_count = state.get("step_count", 0) + 1
     
-    # Get the user ID from the config
-    configurable = configuration.Configuration.from_runnable_config(config)
-    user_id = configurable.user_id
-
-    # Define the namespace for the memories
-    namespace = ("profile", user_id)
-
-    # Retrieve the most recent memories for context
-    existing_items = store.search(namespace)
-
-    # Format the existing memories for the Trustcall extractor
-    existing_memories = None
-    if existing_items:
-        existing_memories = [(item.key, "Profile", item.value) for item in existing_items]
-
-    # Merge the chat history and the instruction
-    TRUSTCALL_INSTRUCTION_FORMATTED = TRUSTCALL_INSTRUCTION.format(time=datetime.now().isoformat())
-    updated_messages = list(merge_message_runs(messages=[SystemMessage(content=TRUSTCALL_INSTRUCTION_FORMATTED)] + state["messages"][:-1]))
-
-    # Initialize the spy for visibility into the tool calls
-    spy = Spy()
+    # Call the model with the system message and conversation history
+    response = model_with_tools.invoke([SystemMessage(content=system_msg)] + state["messages"])
     
-    # Use the profile extractor with the spy
-    local_profile_extractor = profile_extractor.with_listeners(on_end=spy)
+    return {"messages": [response], "step_count": step_count}
 
-    # Invoke the extractor
-    result = local_profile_extractor.invoke({
-        "messages": updated_messages, 
-        "existing": existing_memories
-    })
-
-    # Save the memories from Trustcall to the store
-    for r, rmeta in zip(result["responses"], result["response_metadata"]):
-        store.put(namespace,
-                  rmeta.get("json_doc_id", str(uuid.uuid4())),
-                  r.model_dump(mode="json"),
-            )
-    
-    # Find a tool call ID for this update type
-    tool_call_id = None
-    for tool_call in state['messages'][-1].tool_calls:
-        if tool_call['args']['update_type'] == "user":
-            tool_call_id = tool_call['id']
-            break
-    
-    if tool_call_id:
-        # Extract changes made by the extractor for reporting
-        profile_update_msg = extract_tool_info(spy.called_tools, "Profile")
-        if not profile_update_msg:
-            profile_update_msg = "Profile updated."
-            
-        # Return a tool message response
-        return {"messages": [{"role": "tool", "content": profile_update_msg, "tool_call_id": tool_call_id}]}
-    else:
-        return {"messages": []}
-
-def update_topic(state: MessagesState, config: RunnableConfig, store: BaseStore):
-    """Reflect on the chat history and update the topic memory."""
+def update_profile(state: TutorState, config: RunnableConfig, store: BaseStore):
+    """Node to update the user profile."""
     
     # Get the user ID from the config
     configurable = configuration.Configuration.from_runnable_config(config)
     user_id = configurable.user_id
-
-    # Define the namespace for the memories
-    namespace = ("topic", user_id)
-
-    # Retrieve the most recent memories for context
-    existing_items = store.search(namespace)
-
-    # Format the existing memories for the Trustcall extractor
-    existing_memories = None
-    if existing_items:
-        existing_memories = [(item.key, "ConversationTopic", item.value) for item in existing_items]
-
-    # Merge the chat history and the instruction
-    TRUSTCALL_INSTRUCTION_FORMATTED = TRUSTCALL_INSTRUCTION.format(time=datetime.now().isoformat())
-    updated_messages = list(merge_message_runs(messages=[SystemMessage(content=TRUSTCALL_INSTRUCTION_FORMATTED)] + state["messages"][:-1]))
-
-    # Initialize the spy for visibility into the tool calls
-    spy = Spy()
     
-    # Use the topic extractor with the spy
-    local_topic_extractor = topic_extractor.with_listeners(on_end=spy)
-
-    # Invoke the extractor
-    result = local_topic_extractor.invoke({
-        "messages": updated_messages, 
-        "existing": existing_memories
-    })
-
-    # Save the memories from Trustcall to the store
-    for r, rmeta in zip(result["responses"], result["response_metadata"]):
-        store.put(namespace,
-                  rmeta.get("json_doc_id", str(uuid.uuid4())),
-                  r.model_dump(mode="json"),
+    # Get the last message with tool calls
+    last_message = state["messages"][-1]
+    tool_outputs = []
+    
+    # Process only profile tool calls
+    for tool_call in last_message.tool_calls:
+        if tool_call["name"] == "profile_tool":
+            tool_args = tool_call["args"]
+            tool_id = tool_call["id"]
+            
+            # Update profile in store
+            namespace = ("profile", user_id)
+            store.put(namespace, str(uuid.uuid4()), tool_args)
+            result = f"Updated user profile information"
+            
+            # Create tool message
+            tool_outputs.append(
+                ToolMessage(
+                    content=result,
+                    tool_call_id=tool_id,
+                    name="profile_tool"
+                )
             )
     
-    # Find a tool call ID for this update type
-    tool_call_id = None
-    for tool_call in state['messages'][-1].tool_calls:
-        if tool_call['args']['update_type'] == "topic":
-            tool_call_id = tool_call['id']
-            break
-    
-    if tool_call_id:
-        # Extract changes made by the extractor for reporting
-        topic_update_msg = extract_tool_info(spy.called_tools, "ConversationTopic")
-        if not topic_update_msg:
-            topic_update_msg = "Topic updated."
-            
-        # Return a tool message response
-        return {"messages": [{"role": "tool", "content": topic_update_msg, "tool_call_id": tool_call_id}]}
-    else:
-        return {"messages": []}
+    # Return the tool outputs to be added to messages
+    return {"messages": tool_outputs}
 
-def update_grammar(state: MessagesState, config: RunnableConfig, store: BaseStore):
-    """Reflect on the chat history and update the grammar correction memory."""
+def update_topic(state: TutorState, config: RunnableConfig, store: BaseStore):
+    """Node to update conversation topics."""
     
     # Get the user ID from the config
     configurable = configuration.Configuration.from_runnable_config(config)
     user_id = configurable.user_id
-
-    # Define the namespace for the memories
-    namespace = ("grammar", user_id)
-
-    # Retrieve the most recent memories for context
-    existing_items = store.search(namespace)
-
-    # Format the existing memories for the Trustcall extractor
-    existing_memories = None
-    if existing_items:
-        existing_memories = [(item.key, "GrammarCorrection", item.value) for item in existing_items]
-
-    # Merge the chat history and the instruction
-    TRUSTCALL_INSTRUCTION_FORMATTED = TRUSTCALL_INSTRUCTION.format(time=datetime.now().isoformat())
-    updated_messages = list(merge_message_runs(messages=[SystemMessage(content=TRUSTCALL_INSTRUCTION_FORMATTED)] + state["messages"][:-1]))
-
-    # Initialize the spy for visibility into the tool calls
-    spy = Spy()
     
-    # Use the grammar extractor with the spy
-    local_grammar_extractor = grammar_extractor.with_listeners(on_end=spy)
-
-    # Invoke the extractor
-    result = local_grammar_extractor.invoke({
-        "messages": updated_messages, 
-        "existing": existing_memories
-    })
-
-    # Save the memories from Trustcall to the store
-    for r, rmeta in zip(result["responses"], result["response_metadata"]):
-        store.put(namespace,
-                  rmeta.get("json_doc_id", str(uuid.uuid4())),
-                  r.model_dump(mode="json"),
+    # Get the last message with tool calls
+    last_message = state["messages"][-1]
+    tool_outputs = []
+    
+    # Process only topic tool calls
+    for tool_call in last_message.tool_calls:
+        if tool_call["name"] == "topic_tool":
+            tool_args = tool_call["args"]
+            tool_id = tool_call["id"]
+            
+            # Store topic in store
+            namespace = ("topic", user_id)
+            topic_data = {
+                "topic": tool_args["topic"],
+                "user_interest_level": tool_args["user_interest_level"],
+                "timestamp": datetime.now().isoformat()
+            }
+            store.put(namespace, str(uuid.uuid4()), topic_data)
+            result = f"Recorded topic '{tool_args['topic']}'"
+            
+            # Create tool message
+            tool_outputs.append(
+                ToolMessage(
+                    content=result,
+                    tool_call_id=tool_id,
+                    name="topic_tool"
+                )
             )
     
-    # Find a tool call ID for this update type
-    tool_call_id = None
-    for tool_call in state['messages'][-1].tool_calls:
-        if tool_call['args']['update_type'] == "grammar":
-            tool_call_id = tool_call['id']
-            break
+    # Return the tool outputs to be added to messages
+    return {"messages": tool_outputs}
+
+def update_grammar(state: TutorState, config: RunnableConfig, store: BaseStore):
+    """Node to update grammar corrections."""
     
-    if tool_call_id:
-        # Extract changes made by the extractor for reporting
-        grammar_update_msg = extract_tool_info(spy.called_tools, "GrammarCorrection")
-        if not grammar_update_msg:
-            grammar_update_msg = "Grammar correction recorded."
+    # Get the user ID from the config
+    configurable = configuration.Configuration.from_runnable_config(config)
+    user_id = configurable.user_id
+    
+    # Get the last message with tool calls
+    last_message = state["messages"][-1]
+    tool_outputs = []
+    
+    # Process only grammar tool calls
+    for tool_call in last_message.tool_calls:
+        if tool_call["name"] == "grammar_tool":
+            tool_args = tool_call["args"]
+            tool_id = tool_call["id"]
             
-        # Return a tool message response
-        return {"messages": [{"role": "tool", "content": grammar_update_msg, "tool_call_id": tool_call_id}]}
-    else:
-        return {"messages": []}
-
-
-# Conditional edge
-def route_message(state: MessagesState, config: RunnableConfig, store: BaseStore) -> List[Literal[END, "update_topic", "update_grammar", "update_profile"]]: # type: ignore
-    """Route the message to the appropriate update function based on tool calls."""
-    message = state['messages'][-1]
+            # Store grammar correction in store
+            namespace = ("grammar", user_id)
+            grammar_data = {
+                "original_text": tool_args["original_text"],
+                "corrected_text": tool_args["corrected_text"],
+                "explanation": tool_args["explanation"],
+                "improvement": tool_args["improvement"],
+                "timestamp": datetime.now().isoformat()
+            }
+            store.put(namespace, str(uuid.uuid4()), grammar_data)
+            result = f"Recorded grammar correction"
+            
+            # Create tool message
+            tool_outputs.append(
+                ToolMessage(
+                    content=result,
+                    tool_call_id=tool_id,
+                    name="grammar_tool"
+                )
+            )
     
-    if len(message.tool_calls) == 0:
+    # Return the tool outputs to be added to messages
+    return {"messages": tool_outputs}
+
+## Edge conditions
+
+def route_tools(state: TutorState):
+    """Route to the appropriate tool nodes based on tool calls in the last message."""
+    messages = state["messages"]
+    
+    # If there are no messages or no tool calls, end the flow
+    if not messages or not hasattr(messages[-1], "tool_calls") or not messages[-1].tool_calls:
         return [END]
     
-    # Collect update types needed
-    updates_needed = []
+    # Collect the tool names that were called
+    routes = []
+    tool_names = set(tool_call["name"] for tool_call in messages[-1].tool_calls)
     
-    # Check each tool call
-    for tool_call in message.tool_calls:
-        update_type = tool_call['args']['update_type']
-        if update_type == "user":
-            updates_needed.append("update_profile")
-        elif update_type == "topic":
-            updates_needed.append("update_topic")
-        elif update_type == "grammar":
-            updates_needed.append("update_grammar")
+    # Route to the appropriate tool nodes
+    if "profile_tool" in tool_names:
+        routes.append("profile")
+    if "topic_tool" in tool_names:
+        routes.append("topic")
+    if "grammar_tool" in tool_names:
+        routes.append("grammar")
     
-    # If no updates are needed, end
-    if not updates_needed:
+    # If no valid tools were called, end the flow
+    if not routes:
         return [END]
     
-    return updates_needed
+    return routes
 
-# Create the graph + all nodes
-builder = StateGraph(MessagesState, config_schema=configuration.Configuration)
+## Create the graph
 
-# Define the memory extraction process flow
-builder.add_node(ai_language_tutor)
-builder.add_node(update_topic)
-builder.add_node(update_profile)
-builder.add_node(update_grammar)
+# Create the graph with our state
+workflow = StateGraph(TutorState, config_schema=configuration.Configuration)
 
-# Define the flow 
-builder.add_edge(START, "ai_language_tutor")
+# Add the nodes
+workflow.add_node("tutor", call_model)
+workflow.add_node("profile", update_profile)
+workflow.add_node("topic", update_topic)
+workflow.add_node("grammar", update_grammar)
 
-# Use conditional edges for routing with multiple updates
-builder.add_conditional_edges(
-    "ai_language_tutor",
-    route_message,
-    {
-        "update_topic": "update_topic",
-        "update_profile": "update_profile",
-        "update_grammar": "update_grammar",
-        END: END
-    }
+# Set the entry point
+workflow.set_entry_point("tutor")
+
+# Add conditional edges with multiple possible destinations
+workflow.add_conditional_edges(
+    # After the tutor node
+    "tutor",
+    # The function that routes to tools
+    route_tools,
+    # Mapping of where to go next
+    # {
+    #     "profile": "profile",
+    #     "topic": "topic",
+    #     "grammar": "grammar",
+    #     END: END,
+    # },
 )
 
-# Add returns to ai_language_tutor after each update
-builder.add_edge("update_topic", "ai_language_tutor")
-builder.add_edge("update_profile", "ai_language_tutor")
-builder.add_edge("update_grammar", "ai_language_tutor")
+# Add edges from each tool back to tutor
+workflow.add_edge("profile", "tutor")
+workflow.add_edge("topic", "tutor")
+workflow.add_edge("grammar", "tutor")
 
 # Store for long-term (across-thread) memory
 across_thread_memory = InMemoryStore()
@@ -488,7 +448,10 @@ across_thread_memory = InMemoryStore()
 within_thread_memory = MemorySaver()
 
 # Compile the graph with the checkpointer and store
-graph = builder.compile(checkpointer=within_thread_memory, store=across_thread_memory)
+graph = workflow.compile(
+    checkpointer=within_thread_memory, 
+    store=across_thread_memory
+)
 
 # Generate Mermaid diagram for visualization
 file_name = "graph_mermaid.txt"
@@ -504,14 +467,14 @@ def main():
     input_messages = [HumanMessage(content="Hello, My name is Lance. I live in SF with my wife. I have a 1 year old daughter and I like music and sports.")]
 
     # Run the graph
-    for chunk in graph.stream({"messages": input_messages}, config, stream_mode="values"):
+    for chunk in graph.stream({"messages": input_messages, "step_count": 0, "memory_updates": []}, config, stream_mode="values"):
         chunk["messages"][-1].pretty_print()
     
     # User mentions music preferences with grammar errors
     input_messages = [HumanMessage(content="I like jazz music and some pop. I listen often when I working. It help me concentrate.")]
 
     # Run the graph
-    for chunk in graph.stream({"messages": input_messages}, config, stream_mode="values"):
+    for chunk in graph.stream({"messages": input_messages, "step_count": 0, "memory_updates": []}, config, stream_mode="values"):
         chunk["messages"][-1].pretty_print()
         
     # Check for updated grammar corrections
@@ -526,7 +489,7 @@ def main():
     input_messages = [HumanMessage(content="Hello, the Lakers win tonight, I exit my job earlier to watch with my wife")]
 
     # Run the graph
-    for chunk in graph.stream({"messages": input_messages}, config, stream_mode="values"):
+    for chunk in graph.stream({"messages": input_messages, "step_count": 0, "memory_updates": []}, config, stream_mode="values"):
         chunk["messages"][-1].pretty_print()
         
 if __name__ == "__main__":

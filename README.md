@@ -60,7 +60,7 @@ AzureJay offers a Voice-Powered App with these key features:
 
 - 🗣️ **Conversation-Based Learning**: Natural dialogue with AI tutor
 - 🔍 **Intelligent Error Detection**: Real-time grammar and vocabulary
-- 🧠 **MRKL Architecture**: Hybrid neuro-symbolic system combining neural networks with symbolic reasoning for more accurate explanations
+- 🧠 **MRKL and ReAct**: Hybrid neuro-symbolic system combining neural networks with symbolic reasoning for more accurate explanations
 - 🎯 **Personalized Learning**: Adapts to your interests
 - 📊 **Progress Tracking**: Monitor your improvement over time with detailed analytics
 
