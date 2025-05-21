@@ -24,3 +24,5 @@ email-validator==2.1.0
 wikipedia==1.4.0
 pyspellchecker==0.8.2
 langgraph-checkpoint-redis==0.0.5
+langchain-experimental==0.3.4
+langgraph-supervisor==0.0.23
