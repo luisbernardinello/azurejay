@@ -15,83 +15,67 @@ from langgraph.prebuilt import ToolNode
 from dotenv import load_dotenv
 load_dotenv(override=True)
 import configuration
-
-# Import the custom handoff tool
+import utilities
+# Import the custom handoff tool and LanguageTool integration
 from custom_handoff_tools import create_custom_handoff_to_profile
+from language_tool import LanguageToolAPI, LanguageToolCorrection
 
 #Initialize the LLM
-model = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3)
+model = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.1)
+
+# Initialize LanguageTool API
+language_tool = LanguageToolAPI()
 
 ## Create custom handoff tool
 transfer_to_profile = create_custom_handoff_to_profile()
 
 ## Schema definitions
 class GrammarCorrection(BaseModel):
-    """Grammar correction information"""
-    original_text: str = Field(description="The original text with errors")
-    corrected_text: str = Field(description="The corrected text")
+    """Grammar correction information from LanguageTool"""
+    original_text: str = Field(description="The original text with errors", default=None)
+    corrected_text: str = Field(description="The corrected text", default=None)
     explanation: Optional[str] = Field(description="Brief explanation of the correction", default=None)
-    timestamp: datetime = Field(description="When the correction was made", default_factory=datetime.now)
+    improvement: str = Field(description="Rewritten user's text in a native-like way", default=None)
+    # errors_found: int = Field(description="Number of errors found", default=0)
 
 ## Initialize the model and tools
 class UpdateMemory(TypedDict):
     """ Decision on what memory type to update """
     update_type: Literal['corrections']
 
-## Create the Trustcall extractors
-trustcall_extractor = create_extractor(
-    model,
-    tools=[GrammarCorrection],
-    tool_choice="GrammarCorrection",
-)
-
 ## Prompts 
-MODEL_SYSTEM_MESSAGE = """You are an expert English language tutor and friendly conversation partner.
+MODEL_SYSTEM_MESSAGE = """You are an English language tutor and conversation partner.
 
-You are designed to help users improve their English through natural conversation and gentle corrections.
-
-You have access to long-term memory about the user's profile and grammar corrections.
-
-Here is the current User Profile (may be empty if no information has been collected yet):
-<user_profile>
+Current User Profile:
 {user_profile}
-</user_profile>
 
-Here are the current corrections you've made (may be empty if no corrections have been recorded yet):
-<corrections>
+Current Corrections:
 {corrections}
-</corrections>
 
-Your main responsibilities:
-1. **FIRST PRIORITY - Grammar Check**: Always check if the user's message contains grammar, spelling, or punctuation errors
-2. **SECOND PRIORITY - Profile Information**: Check if the user shared personal information (name, location, interests, family, job, etc.)
+LanguageTool Analysis (Must be prioritized):
+{languagetool_analysis}
 
-Decision Logic:
-- If there ARE grammar errors AND there IS personal information → Save grammar correction first, then transfer to profile agent
-- If there ARE grammar errors AND there is NO personal information → Save grammar correction and provide friendly feedback
-- If there are NO grammar errors AND there IS personal information → Transfer to profile agent  
-- If there are NO grammar errors AND there is NO personal information → Continue conversation naturally
+MANDATORY ACTIONS - Check in this exact order:
 
-When correcting grammar:
-- Be gentle and friendly, especially if you have user profile information
-- Ask the user to try saying the corrected version
-- Use their name and interests if available from the profile
-- Explain the correction in simple terms
+1. **GRAMMAR CHECK**: If LanguageTool found errors OR you detect semantic/flow errors → MUST call UpdateMemory with update_type='corrections'
 
-When continuing conversation:
-- Use information from the user profile to personalize responses
-- Ask follow-up questions about their interests
-- Be warm and encouraging
+2. **PERSONAL INFO CHECK**: If user shares name, location, interests, family, job, etc. → MUST call transfer_to_profile and transfer also the user's original message in this pattern: "user's message: `message`"
 
-Remember: Don't tell the user that you updated memory or transferred to another agent."""
+3. **CONTINUE CONVERSATION**: Only if no personal info → respond naturally using saved profile (may be empty if no information has been collected yet) in a warm, friendly manner as if you're a long-term friend AND if you notice corrections were made to their English, mention them casually and constructively
 
-TRUSTCALL_INSTRUCTION = """Analyze the following conversation and extract any grammar corrections that were made.
+You MUST prioritize saving grammar corrections. Always call UpdateMemory first when errors are found.
+
+Don't tell the user that you have updated your memory or used LanguageTool. """
+
+TRUSTCALL_INSTRUCTION = """Extract grammar correction information from this interaction.
+
+Include original text, corrected version, explanation in a native way and errors found.(Don't use markdown or formatation style)
 
 System Time: {time}"""
 
 ## Node definitions
 def corrections_agent(state: MessagesState, config: RunnableConfig, store: BaseStore):
-    """Main correction agent that checks grammar and decides on next actions."""
+    """Main correction agent that checks grammar using LanguageTool and decides on next actions."""
     
     # Get the user ID from the config
     configurable = configuration.Configuration.from_runnable_config(config)
@@ -107,15 +91,33 @@ def corrections_agent(state: MessagesState, config: RunnableConfig, store: BaseS
     memories = store.search(namespace)
     corrections = memories[0].value if memories else None
     
+    # Get the user's latest message
+    user_message = state["messages"][-1].content if state["messages"] else ""
+    
+    # Check grammar using LanguageTool
+    languagetool_result = language_tool.check_text(user_message)
+    
+    # Format LanguageTool analysis for the prompt
+    if languagetool_result.errors:
+        languagetool_analysis = f"""
+Original text: "{languagetool_result.original_text}"
+Corrected text: "{languagetool_result.corrected_text}"
+Errors found: {len(languagetool_result.errors)}
+Explanation: {languagetool_result.explanation}
+"""
+    else:
+        languagetool_analysis = "No grammar errors found by LanguageTool."
+    
     system_msg = MODEL_SYSTEM_MESSAGE.format(
         user_profile=user_profile, 
-        corrections=corrections
+        corrections=corrections,
+        languagetool_analysis=languagetool_analysis
     )
 
     # Use parallel tool calls to allow both grammar correction and profile transfer if needed
     response = model.bind_tools(
         [UpdateMemory, transfer_to_profile], 
-        parallel_tool_calls=True
+        parallel_tool_calls=False
     ).invoke([SystemMessage(content=system_msg)] + state["messages"])
 
     return {"messages": [response]}
@@ -145,6 +147,16 @@ def update_corrections(state: MessagesState, config: RunnableConfig, store: Base
     TRUSTCALL_INSTRUCTION_FORMATTED = TRUSTCALL_INSTRUCTION.format(time=datetime.now().isoformat())
     updated_messages = list(merge_message_runs(messages=[SystemMessage(content=TRUSTCALL_INSTRUCTION_FORMATTED)] + state["messages"][:-1]))
 
+    spy = utilities.Spy()
+    
+    ## Create the Trustcall extractors
+    trustcall_extractor = create_extractor(
+        model,
+        tools=[GrammarCorrection],
+        tool_choice=tool_name,
+        enable_inserts=True
+    ).with_listeners(on_end=spy)
+    
     try:
         # Invoke the extractor
         result = trustcall_extractor.invoke({"messages": updated_messages, 
@@ -156,6 +168,7 @@ def update_corrections(state: MessagesState, config: RunnableConfig, store: Base
                       rmeta.get("json_doc_id", str(uuid.uuid4())),
                       r.model_dump(mode="json"),
                 )
+        print("Correction SAVED\n")
     except Exception as e:
         print(f"Error in grammar correction extraction: {e}")
     

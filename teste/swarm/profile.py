@@ -15,12 +15,13 @@ from langgraph.prebuilt import ToolNode
 from dotenv import load_dotenv
 load_dotenv(override=True)
 import configuration
+import utilities
 
 # Import the custom handoff tool
 from custom_handoff_tools import create_custom_handoff_to_correction
 
 #Initialize the LLM
-model = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3)
+model = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.1)
 
 ## Create custom handoff tool
 transfer_to_correction_agent = create_custom_handoff_to_correction()
@@ -28,59 +29,43 @@ transfer_to_correction_agent = create_custom_handoff_to_correction()
 ## Schema definitions
 class UserProfile(BaseModel):
     """ Profile of a user """
-    user_name: str = Field(description="The user's preferred name")
-    user_location: str = Field(description="The user's location")
-    interests: list = Field(description="A list of the user's interests")
-
+    user_name: str = Field(description="The user's preferred name", default=None)
+    user_location: str = Field(description="The user's location", default=None)
+    interests: list[str] = Field(
+        description="Interests that the user has", 
+        default_factory=list
+    )
+    
 ## Initialize the model and tools
 class UpdateMemory(TypedDict):
     """ Decision on what memory type to update """
     update_type: Literal['profile']
 
-## Create the Trustcall extractors
-trustcall_extractor = create_extractor(
-    model,
-    tools=[UserProfile],
-    tool_choice="UserProfile",
-)
 
 ## Prompts 
-MODEL_SYSTEM_MESSAGE = """You are a friendly English conversation partner focused on getting to know users personally.
+MODEL_SYSTEM_MESSAGE = """You are a friendly English conversation partner.
 
-You have access to long-term memory about the user's profile and grammar corrections.
-
-Here is the current User Profile (may be empty if no information has been collected yet):
-<user_profile>
+Current User Profile:
 {user_profile}
-</user_profile>
 
-Here are recent grammar corrections (for context):
-<corrections>
+Recent Corrections:
 {corrections}
-</corrections>
 
-Your responsibilities:
-1. **Extract and save personal information** shared by the user (name, location, interests, family, job, etc.)
-2. **Continue friendly conversation** using saved profile information
-3. **Transfer back to correction agent** if you detect grammar errors
+MANDATORY ACTIONS - Check in this exact order:
 
-Decision Logic:
-- If there IS personal information to extract → Save it to profile memory and respond warmly
-- If there are NO grammar errors and NO new personal information → Continue conversation naturally using existing profile
-- If there ARE grammar errors → Transfer back to correction agent
+1. **EXTRACT PERSONAL INFO**: If personal information was provided about the user → MUST call UpdateMemory with update_type='profile'
 
-Conversation Guidelines:
-- Be warm and personable, using the user's name when available
-- Reference their interests and personal details naturally in conversation
-- Ask follow-up questions about their life, interests, and experiences
-- Make them feel heard and remembered
-- If you know their interests, occasionally bring up related topics
+2. **CHECK GRAMMAR INSTRUCTIONS** (Check in this exact order):
+    2.1 - Compare the FIRST message (user's original input) with the last correction message (final response)
+    2.2 - Check if the original message had grammatical errors
+    2.3 - Check if those errors were corrected in the final response
+    2.4 - If the original message had errors AND they weren't corrected in the final response → MUST call transfer_to_correction_agent pointing the error.
+    
+3. **CONTINUE CONVERSATION**: Only if no errors missing by the final response are detected by you -> respond naturally using saved profile (may be empty if no information has been collected yet)
+   
+You MUST prioritize saving personal information. Always call UpdateMemory first when personal info is shared."""
 
-Remember: Don't tell the user that you updated memory or transferred to another agent."""
-
-TRUSTCALL_INSTRUCTION = """Analyze the following conversation and extract any personal information about the user that should be saved to their profile.
-
-Focus on: name, location, interests, family, job, hobbies, preferences.
+TRUSTCALL_INSTRUCTION = """Extract personal information from this conversation: name, location, and interests (If already exists, only update the interests list and don't include the same interest twice).
 
 System Time: {time}"""
 
@@ -110,7 +95,7 @@ def profile_agent(state: MessagesState, config: RunnableConfig, store: BaseStore
     # Use parallel tool calls
     response = model.bind_tools(
         [UpdateMemory, transfer_to_correction_agent], 
-        parallel_tool_calls=True
+        parallel_tool_calls=False
     ).invoke([SystemMessage(content=system_msg)] + state["messages"])
 
     return {"messages": [response]}
@@ -140,6 +125,16 @@ def update_memories(state: MessagesState, config: RunnableConfig, store: BaseSto
     TRUSTCALL_INSTRUCTION_FORMATTED = TRUSTCALL_INSTRUCTION.format(time=datetime.now().isoformat())
     updated_messages = list(merge_message_runs(messages=[SystemMessage(content=TRUSTCALL_INSTRUCTION_FORMATTED)] + state["messages"][:-1]))
 
+    # Initialize the spy for visibility into the tool calls made by Trustcall
+    spy = utilities.Spy()
+    
+    ## Create the Trustcall extractors
+    trustcall_extractor = create_extractor(
+        model,
+        tools=[UserProfile],
+        tool_choice="UserProfile",
+    ).with_listeners(on_end=spy)
+
     try:
         # Invoke the extractor
         result = trustcall_extractor.invoke({"messages": updated_messages, 
@@ -151,6 +146,9 @@ def update_memories(state: MessagesState, config: RunnableConfig, store: BaseSto
                       rmeta.get("json_doc_id", str(uuid.uuid4())),
                       r.model_dump(mode="json"),
                 )
+        
+        print("Profile SAVED\n")
+
     except Exception as e:
         print(f"Error in profile extraction: {e}")
 
