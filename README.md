@@ -3,7 +3,7 @@
   <br/>
   <font size="6"><b>AzureJay</b></font>
   <br/>
-  <em>A neuro-symbolic conversation-based language learning platform</em>
+  <em>A conversation-based language learning app</em>
   <br/><br/>
   <a href="#"><img src="https://img.shields.io/badge/Try_now-azurejay.app-darkcyan" /></a>
   <a href="#"><img src="https://img.shields.io/badge/List_of_courses-azurejay.app/courses-darkcyan" /></a>
@@ -15,9 +15,9 @@
 
 ## About
 
-AzureJay, represented by an Atlantic Bird mascot, is a conversational language learning app whose mission is to provide a efficient conversational experience for language learning through AI-powered interactions using MRKL (Modular Reasoning, Knowledge, and Language) architecture. Our platform offers a refreshing alternative to traditional language learning apps by focusing on natural conversation.
+AzureJay, represented by an Atlantic Bird mascot, is a conversational language learning app whose mission is to provide an efficient conversational experience for language learning through AI-powered interactions using an intelligent Supervisor architecture.
 
-Unlike conventional apps that rely solely on predefined lessons, AzureJay engages users in natural conversations while intelligently detecting errors in grammar and vocabulary, providing real-time corrections and explanations. The system combines neural network models with symbolic reasoning to deliver a more effective language learning experience.
+Unlike conventional apps that rely solely on predefined lessons, AzureJay engages users in natural conversations while orchestrating multiple specialized agents to detect errors in grammar and vocabulary, gather contextual information, and provide corrections and explanations. The system combines neural network models with symbolic reasoning through a multi-agent workflow to deliver a conversational language learning experience.
 
 <details open="open">
   <summary>Table of Contents</summary>
@@ -29,9 +29,11 @@ Unlike conventional apps that rely solely on predefined lessons, AzureJay engage
       <a href="#features">Features</a>
     </li>
     <li>
-      <a href="#mrkl-architecture">MRKL Architecture</a>
+      <a href="#supervisor-architecture">Supervisor Architecture</a>
       <ul>
         <li><a href="#architecture-overview">Architecture Overview</a></li>
+        <li><a href="#specialized-agents">Specialized Agents</a></li>
+        <li><a href="#workflow-orchestration">Workflow Orchestration</a></li>
       </ul>
     </li>
     <li>
@@ -59,16 +61,18 @@ Unlike conventional apps that rely solely on predefined lessons, AzureJay engage
 AzureJay offers a Voice-Powered App with these key features:
 
 - 🗣️ **Conversation-Based Learning**: Natural dialogue with AI tutor
-- 🔍 **Intelligent Error Detection**: Real-time grammar and vocabulary
-- 🧠 **MRKL and ReAct**: Hybrid neuro-symbolic system combining neural networks with symbolic reasoning for more accurate explanations
-- 🎯 **Personalized Learning**: Adapts to your interests
+- 🔍 **Multi-Layer Error Detection**: Real-time grammar and semantic correction using LanguageTool API and LLM verification
+- 🧠 **Supervisor Architecture**: Intelligent workflow orchestration with specialized agents for different tasks
+- 🎯 **Personalized Learning**: Adapts to your interests and maintains long-term memory of your progress
 - 📊 **Progress Tracking**: Monitor your improvement over time with detailed analytics
+- 🔗 **Contextual Research**: Web search integration for real-time information gathering
+- 💾 **Persistent Memory**: Long-term storage of user profiles and grammar correction history
 
-## MRKL Architecture
+## Supervisor Architecture
 
 ### Architecture Overview
 
-AzureJay is built on the MRKL (Modular Reasoning, Knowledge, and Language) architecture, a cutting-edge neuro-symbolic approach that combines the strengths of neural networks with symbolic reasoning systems:
+AzureJay is built on an intelligent Supervisor architecture that orchestrates multiple specialized agents to provide comprehensive language learning support:
 
 ```
                                                       +-----------+
@@ -78,16 +82,66 @@ AzureJay is built on the MRKL (Modular Reasoning, Knowledge, and Language) archi
                                                              *
                                                              *
                                                   +-------------------+
-                                               ...| ai_language_tutor |....
+                                               ...| supervisor        |....
                                      ..........  *+-------------------+.   .........
                           ...........       *****            *          .....       ..........
                 ..........             *****                *                ....             .........
           ......                    ***                     *                    ...                   .....
 +---------+           +----------------+           +----------------+           +--------------+           +----------------+
-| __end__ |           | update_grammar |           | update_profile |           | update_topic |           | web_search_api |
+| __end__ |           | correction     |           | researcher     |           | responder    |           | web_search_api |
 +---------+           +----------------+           +----------------+           +--------------+           +----------------+
-
 ```
+
+### Specialized Agents
+
+The Supervisor coordinates the following specialized agents:
+
+#### 🎯 **Supervisor Agent**
+
+- **Role**: Central workflow orchestrator
+- **Responsibilities**:
+  - Routes tasks to appropriate specialists based on current state
+  - Ensures efficient workflow without unnecessary steps
+  - Maintains transparency in decision-making process
+
+#### ✏️ **Correction Agent**
+
+- **Role**: Multi-layer grammar and semantic correction specialist
+- **Layer 1 - Syntax Analysis**: Uses LanguageTool API for comprehensive grammar checking
+- **Layer 2 - Semantic Verification**: Employs LLM verification for contextual and semantic corrections
+- **Layer 3 - Synthesis**: Combines suggestions from both layers for optimal corrections
+
+#### 🔍 **Research Agent**
+
+- **Role**: Information gathering and fact-finding specialist
+- **Capabilities**:
+  - Web search integration using Tavily Search API
+  - Updated information retrieval
+  - Source credibility assessment
+  - Structured information presentation
+- **Activation**: Called only when users ask direct questions
+
+#### 🤖 **Responder Agent (Subgraph)**
+
+- **Role**: Conversational AI tutor with memory management
+- **Components**:
+  - **Memory Management**: Long-term storage of user profiles and correction history
+  - **Personalized Responses**: Adapts to user interests and learning progress
+  - **TrustCall Integration**: Structured information extraction and storage
+  - **Contextual Awareness**: Incorporates corrections and research into responses
+
+### Workflow Orchestration
+
+1. **Input Processing**: User message enters the system
+2. **Grammar Correction**: Supervisor routes to Correction Agent
+3. **Research Evaluation**: Determines if external information gathering is needed
+4. **Response Generation**: Routes to Responder subgraph for final interaction
+5. **Memory Updates**: Automatically saves user profiles and correction history
+
+**Key Benefits:**
+
+- **Accuracy**: Multi-layer correction ensures high-quality feedback
+- **Personalization**: Long-term memory enables personalized learning experiences
 
 ### Getting Started
 
@@ -114,14 +168,12 @@ cd AzureJay
 
 ## Milestones
 
-- [x] 🏁 Core MRKL architecture implementation
-- [x] 🏁 Intelligent router for module selection
-- [x] 🏁 Neuro-symbolic grammar correction system
-- [x] 🏁 Basic conversation generation
-- [x] 🏁 Knowledge retrieval integration
-- [x] 🏁 User profiling and personalization
-- [x] 🏁 Response orchestration system
-- [x] 🏁 Basic theme/branding
+- [x] 🏁 Supervisor architecture implementation
+- [x] 🏁 Multi-layer grammar correction with LanguageTool integration
+- [x] 🏁 Semantic verification using LLM models
+- [x] 🏁 Research agent with web search capabilities
+- [x] 🏁 Memory management with TrustCall integration
+- [x] 🏁 User profiling and personalization system
 - [x] 🏁 Initial language support for English
 - [ ] 🏁 KMP application development
 - [ ] 🏁 Enhanced pronunciation assessment
@@ -130,6 +182,8 @@ cd AzureJay
 
 - [ ] Cultural context integration in conversations
 - [ ] Spaced repetition based on conversation history
+- [ ] Additional specialized agents for pronunciation and fluency
+- [ ] Multi-language supervisor architecture support
 
 ## Contribution
 
