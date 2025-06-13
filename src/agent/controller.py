@@ -41,11 +41,22 @@ async def chat_with_existing_conversation(
             conversation_id=conversation_id
         )
         
+        # Create a wrapper function that matches the new signature
+        def add_message_wrapper(db, user_id, conversation_id, human_message, ai_response, improvement_analysis=None):
+            return add_message_to_conversation(
+                db=db,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                human_message=human_message,
+                ai_response=ai_response,
+                improvement_analysis=improvement_analysis
+            )
+        
         return await service.chat_with_agent(
             db=db,
             user_id=user_id,
             request=agent_request,
-            add_message_func=add_message_to_conversation
+            add_message_func=add_message_wrapper
         )
     except PermissionError as e:
         raise HTTPException(

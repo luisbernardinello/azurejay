@@ -10,6 +10,7 @@ from typing import Annotated, Literal, Optional, TypedDict, Dict, Any, Union
 from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import merge_message_runs
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import AIMessage as CoreAIMessage
 
 from langgraph.func import entrypoint, task
 from langgraph.checkpoint.memory import MemorySaver
@@ -292,8 +293,11 @@ def update_user_profile(messages: list, user_id: str, *, store: BaseStore) -> st
         return f"Error updating profile: {e}"
 
 @task
-def update_grammar_corrections(messages: list, user_id: str, *, store: BaseStore) -> str:
-    """Extract and save grammar correction information."""
+def update_grammar_corrections(messages: list, user_id: str, *, store: BaseStore) -> dict:
+    """
+    Extract and save grammar correction information.
+    Returns the improvement text if available.
+    """
     
     # Define the namespace for the memories
     namespace = ("corrections", user_id)
@@ -330,21 +334,33 @@ def update_grammar_corrections(messages: list, user_id: str, *, store: BaseStore
                                              "existing": existing_memories})
 
         # Save the memories from Trustcall to the store
+        improvement_text = None
         for r, rmeta in zip(result["responses"], result["response_metadata"]):
+            stored_data = r.model_dump(mode="json")
             store.put(namespace,
                       rmeta.get("json_doc_id", str(uuid.uuid4())),
-                      r.model_dump(mode="json"),
+                      stored_data,
                 )
+            # Extract the improvement text from the first correction
+            if improvement_text is None and 'improvement' in stored_data:
+                improvement_text = stored_data['improvement']
             
         print("--- Grammar correction information updated ---")
         
         # Extract the changes made by Trustcall
         grammar_correction_update_msg = extract_tool_info(spy.called_tools, tool_name)
-        return grammar_correction_update_msg or "Grammar correction updated successfully"
+        
+        return {
+            "message": grammar_correction_update_msg or "Grammar correction updated successfully",
+            "improvement": improvement_text
+        }
         
     except Exception as e:
         print(f"Error in grammar correction extraction: {e}")
-        return f"Error updating grammar corrections: {e}"
+        return {
+            "message": f"Error updating grammar corrections: {e}",
+            "improvement": None
+        }
 
 ## Entrypoint definition
 @entrypoint(checkpointer=get_checkpointer(), store=get_store())
@@ -368,6 +384,7 @@ def responder_workflow(input_data: dict, *, config: RunnableConfig, store: BaseS
     
     # Step 3: Handle memory updates if needed
     update_messages = []
+    improvement_text = None
     
     if ai_response_data["has_tool_calls"]:
         update_type = ai_response_data["update_type"]
@@ -384,9 +401,10 @@ def responder_workflow(input_data: dict, *, config: RunnableConfig, store: BaseS
         elif update_type == "grammar":
             grammar_future = update_grammar_corrections(messages, user_id, store=store)
             grammar_result = grammar_future.result()
+            improvement_text = grammar_result.get("improvement")
             update_messages.append({
                 "role": "tool", 
-                "content": grammar_result, 
+                "content": grammar_result["message"], 
                 "tool_call_id": ai_response_data["response"].tool_calls[0]['id']
             })
             
@@ -397,6 +415,7 @@ def responder_workflow(input_data: dict, *, config: RunnableConfig, store: BaseS
             
             profile_result = profile_future.result()
             grammar_result = grammar_future.result()
+            improvement_text = grammar_result.get("improvement")
             
             update_messages.append({
                 "role": "tool", 
@@ -413,8 +432,15 @@ def responder_workflow(input_data: dict, *, config: RunnableConfig, store: BaseS
             final_response_future = generate_ai_response(final_messages, memories)
             final_response_data = final_response_future.result()
             
+            # Create the final AI message with improvement in additional_kwargs if available
+            final_ai_message = final_response_data["response"]
+            if improvement_text:
+                # Add improvement to additional_kwargs for later extraction
+                final_ai_message.additional_kwargs = final_ai_message.additional_kwargs or {}
+                final_ai_message.additional_kwargs['improvement'] = improvement_text
+            
             return {
-                "messages": final_messages + [final_response_data["response"]]
+                "messages": final_messages + [final_ai_message]
             }
     
     # If no tool calls or updates needed, return the original response

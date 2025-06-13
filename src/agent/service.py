@@ -61,7 +61,7 @@ async def chat_with_agent(
     db: Session,
     user_id: UUID,
     request: models.AgentRequest,
-    add_message_func: Callable[[Session, UUID, UUID, str, str], None]  # INJEÇÃO DE DEPENDÊNCIA
+    add_message_func: Callable[[Session, UUID, UUID, str, str, dict], None]  # UPDATED: Added dict parameter for improvement_analysis
 ) -> models.AgentResponse:
     """
     Processes a chat message with the AI agent and updates the conversation in PostgreSQL.
@@ -91,6 +91,7 @@ async def chat_with_agent(
     app = get_agent_graph()
     input_messages = [HumanMessage(content=request.content)]
     final_response = None
+    improvement_analysis = None
 
     try:
         # Collect all messages during streaming
@@ -120,6 +121,12 @@ async def chat_with_agent(
                     last_message.content.strip()):
                     final_response = last_message
                     logging.info(f"Final response captured from responder: {last_message.content[:100]}...")
+                    
+                    # Check if this message has improvement analysis
+                    if hasattr(last_message, 'additional_kwargs') and 'improvement' in last_message.additional_kwargs:
+                        improvement_analysis = {"improvement": last_message.additional_kwargs['improvement']}
+                        logging.info(f"Improvement analysis captured: {improvement_analysis}")
+                    
                     break  # Important: exit loop once final response is found
                 
                 # ALTERNATIVE: If above condition doesn't work, try to capture 
@@ -142,6 +149,12 @@ async def chat_with_agent(
                          msg.name in ['supervisor', 'correction', 'researcher', 'enhancer', 'validator'])):
                     final_response = msg
                     logging.info(f"Final response found in message history: {msg.content[:100]}...")
+                    
+                    # Check if this message has improvement analysis
+                    if hasattr(msg, 'additional_kwargs') and 'improvement' in msg.additional_kwargs:
+                        improvement_analysis = {"improvement": msg.additional_kwargs['improvement']}
+                        logging.info(f"Improvement analysis found in message history: {improvement_analysis}")
+                    
                     break
 
         if final_response is None:
@@ -153,7 +166,8 @@ async def chat_with_agent(
             user_id=user_id,
             conversation_id=conversation_id,
             human_message=request.content,
-            ai_response=final_response.content
+            ai_response=final_response.content,
+            improvement_analysis=improvement_analysis  # Pass the improvement analysis
         )
 
         return models.AgentResponse(

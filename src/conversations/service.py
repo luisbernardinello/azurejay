@@ -117,6 +117,7 @@ async def create_new_conversation(
     app = get_agent_graph()
     input_messages = [HumanMessage(content=request.content)]
     final_response = None
+    improvement_analysis = None
 
     try:
         # Collect all messages during streaming
@@ -146,6 +147,12 @@ async def create_new_conversation(
                     last_message.content.strip()):
                     final_response = last_message
                     logging.info(f"Final response captured from responder: {last_message.content[:100]}...")
+                    
+                    # Check if this message has improvement analysis
+                    if hasattr(last_message, 'additional_kwargs') and 'improvement' in last_message.additional_kwargs:
+                        improvement_analysis = {"improvement": last_message.additional_kwargs['improvement']}
+                        logging.info(f"Improvement analysis captured: {improvement_analysis}")
+                    
                     break  # Important: exit loop once final response is found
                 
                 # ALTERNATIVE: If above condition doesn't work, try to capture 
@@ -168,6 +175,12 @@ async def create_new_conversation(
                          msg.name in ['supervisor', 'correction', 'researcher', 'enhancer', 'validator'])):
                     final_response = msg
                     logging.info(f"Final response found in message history: {msg.content[:100]}...")
+                    
+                    # Check if this message has improvement analysis
+                    if hasattr(msg, 'additional_kwargs') and 'improvement' in msg.additional_kwargs:
+                        improvement_analysis = {"improvement": msg.additional_kwargs['improvement']}
+                        logging.info(f"Improvement analysis found in message history: {improvement_analysis}")
+                    
                     break
 
         if final_response is None:
@@ -179,12 +192,12 @@ async def create_new_conversation(
             {
                 "role": "human",
                 "content": request.content,
-                "analysis": None  # Você pode adicionar análise aqui se necessário
+                "analysis": None  # Human messages don't have analysis
             },
             {
                 "role": "ai",
                 "content": final_response.content,
-                "analysis": None
+                "analysis": improvement_analysis  # Store improvement if available
             }
         ]
         
@@ -224,10 +237,12 @@ def add_message_to_conversation(
     user_id: UUID,
     conversation_id: UUID,
     human_message: str,
-    ai_response: str
+    ai_response: str,
+    improvement_analysis: dict = None
 ) -> None:
     """
     Adds new messages to an existing conversation in PostgreSQL.
+    Now includes optional improvement_analysis for AI responses.
     """
     try:
         # Buscar a conversa
@@ -248,12 +263,12 @@ def add_message_to_conversation(
             {
                 "role": "human",
                 "content": human_message,
-                "analysis": None
+                "analysis": None  # Human messages don't have analysis
             },
             {
                 "role": "ai",
                 "content": ai_response,
-                "analysis": None
+                "analysis": improvement_analysis  # Store improvement if available
             }
         ]
         
