@@ -1,15 +1,15 @@
 from pydantic import BaseModel, Field
 from uuid import UUID, uuid4
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 
 class Message(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     content: str
     timestamp: datetime = Field(default_factory=datetime.now)
-    is_user: bool  # True se a mensagem for do usuário, False se for do sistema
-
+    role: Literal['human', 'ai']
+    correction: Optional[str] = None
 
 class Conversation(BaseModel):
     id: UUID = Field(default_factory=uuid4)
@@ -19,13 +19,13 @@ class Conversation(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     
-    def add_message(self, content: str, is_user: bool = True) -> Message:
+    def add_message(self, content: str, role: Literal['human', 'ai']) -> Message:
         """
         Adiciona uma nova mensagem à conversa e atualiza o timestamp
         """
         message = Message(
             content=content,
-            is_user=is_user
+            role=role
         )
         self.messages.append(message)
         self.updated_at = datetime.now()

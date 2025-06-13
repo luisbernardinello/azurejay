@@ -1,182 +1,173 @@
+# src/agent/service.py
 import json
 import logging
-from uuid import UUID
-import redis
-from sqlalchemy.orm import Session
+from time import time
+from uuid import UUID, uuid4
+import traceback
 from langchain_core.messages import HumanMessage, AIMessage
-from langgraph.store.redis import RedisStore, AsyncRedisStore
-from langgraph.checkpoint.redis import RedisSaver, AsyncRedisSaver
+from src.database.core import CheckpointerDep, RedisDep, StoreDep
+
 from . import models
-from . import utils
-from . import graph
-from ..conversations import service as conversation_service
+from .supervisor import create_agent_graph
 
-def get_memory_key(user_id: UUID) -> str:
-    """Generate a key for storing user memory in Redis"""
-    return f"user_memory:{user_id}"
+# A global variable to hold the compiled graph singleton
+agent_graph = None
 
-def process_message(
-    redis_client: redis.Redis,
-    db: Session, 
-    user_id: UUID, 
-    conversation_id: UUID, 
-    message: str,
+def get_agent_graph(): # type: ignore
+    """
+    Creates and returns a singleton instance of the compiled agent graph.
+    This ensures the graph is only compiled once per application lifecycle.
+    """
+    global agent_graph
+    if agent_graph is None:
+        logging.info("Compiling agent graph for the first time.")
+        agent_graph = create_agent_graph()
+    return agent_graph
+
+async def validate_conversation_access(
+    redis_client: RedisDep,
+    user_id: UUID,
+    conversation_id: UUID
+) -> None:
+    """
+    Validates that a conversation exists and belongs to the specified user.
+    Raises appropriate exceptions if validation fails.
+    """
+    index_key = f"user_conversations:{user_id}"
+    
+    try:
+        # Get all conversations for the user
+        conv_data = redis_client.zrange(index_key, 0, -1)
+        
+        # Check if the conversation exists in the user's list
+        conversation_found = False
+        for item_json in conv_data:
+            item_data = json.loads(item_json)
+            if item_data['id'] == str(conversation_id):
+                conversation_found = True
+                break
+        
+        if not conversation_found:
+            raise FileNotFoundError(f"Conversation {conversation_id} not found or does not belong to user {user_id}")
+            
+    except json.JSONDecodeError as e:
+        logging.error(f"Error parsing conversation data for user {user_id}: {e}")
+        raise Exception("Error validating conversation access")
+    except Exception as e:
+        logging.error(f"Error validating conversation access for user {user_id}, conversation {conversation_id}: {e}")
+        raise
+
+async def chat_with_agent(
+    redis_client: RedisDep,
+    user_id: UUID,
+    request: models.AgentRequest,
 ) -> models.AgentResponse:
     """
-    Process a user message through the agent graph
+    Processes a chat message with the AI agent and updates the conversation index.
+    This function is used for continuing existing conversations (when conversation_id is provided).
     """
-    try:
-        # Initialize a Redis connection for LangGraph
-        redis_uri = f"redis://{redis_client.connection_pool.connection_kwargs.get('host', 'localhost')}:{redis_client.connection_pool.connection_kwargs.get('port', 6379)}/0"
-        
-        # Setup LangGraph components
-        with RedisSaver.from_conn_string(redis_uri) as checkpointer:
-            checkpointer.setup()
-            
-            with RedisStore.from_conn_string(redis_uri) as store:
-                store.setup()
-                
-                # Create the graph
-                agent_graph = graph.create_agent_graph(store)
-                
-                # Create the config for the graph
-                config = {
-                    "configurable": {
-                        "user_id": str(user_id),
-                    }
-                }
-                
-                # Create the input state with the user message
-                input_messages = [HumanMessage(content=message)]
-                
-                # Run the graph
-                result = agent_graph.invoke({"messages": input_messages}, config)
-                
-                # Extract the response (last message)
-                last_message = result["messages"][-1]
-                response_content = last_message.content if hasattr(last_message, 'content') else str(last_message)
-                
-                # Create the response object
-                response = models.AgentResponse(
-                    message=response_content,
-                    updated_memory=None  # We'll populate this in get_user_memory
-                )
-                
-                # Check if there's grammar correction info
-                namespace = ("grammar", str(user_id))
-                grammar_memories = store.search(namespace)
-                
-                if grammar_memories:
-                    # Sort by timestamp to get the most recent correction
-                    corrections = [mem.value for mem in grammar_memories]
-                    sorted_corrections = sorted(
-                        corrections, 
-                        key=lambda x: x.get('timestamp', ''), 
-                        reverse=True
-                    )
-                    
-                    if sorted_corrections:
-                        latest = sorted_corrections[0]
-                        response.grammar_correction = models.GrammarCorrectionResponse(
-                            original_text=latest.get("original_text", ""),
-                            corrected_text=latest.get("corrected_text", ""),
-                            explanation=latest.get("explanation", "")
-                        )
-                
-                return response
-                
-    except Exception as e:
-        logging.error(f"Error processing message through agent: {str(e)}", exc_info=True)
-        raise
+    if not request.conversation_id:
+        raise ValueError("conversation_id is required for chat_with_agent. Use create_new_conversation for new conversations.")
+    
+    conversation_id = request.conversation_id
+    
+    config = {
+        "configurable": {
+            "thread_id": str(conversation_id),
+            "user_id": str(user_id),
+        }
+    }
 
-def get_user_memory(redis_client: redis.Redis, user_id: UUID) -> models.AgentMemoryResponse:
-    """
-    Get the agent's memory for a user
-    """
-    try:
-        # Initialize a Redis connection for LangGraph
-        redis_uri = f"redis://{redis_client.connection_pool.connection_kwargs.get('host', 'localhost')}:{redis_client.connection_pool.connection_kwargs.get('port', 6379)}/0"
-        
-        # Setup LangGraph components
-        with RedisSaver.from_conn_string(redis_uri) as checkpointer:
-            # Retrieve memory components from Redis store
-            with RedisStore.from_conn_string(redis_uri) as store:
-                
-                profile_data = None
-                topics_data = []
-                grammar_data = []
-                web_search_data = {}
-                
-                # Get profile memory
-                profile_memories = store.search(("profile", str(user_id)))
-                if profile_memories:
-                    profile_data = profile_memories[0].value
-                
-                # Get topics memory
-                topic_memories = store.search(("topic", str(user_id)))
-                if topic_memories:
-                    topics_data = [mem.value for mem in topic_memories]
-                
-                # Get grammar memory
-                grammar_memories = store.search(("grammar", str(user_id)))
-                if grammar_memories:
-                    grammar_data = [mem.value for mem in grammar_memories]
-                
-                # Get web search memory
-                web_search_memories = store.search(("web_search", str(user_id)))
-                if web_search_memories:
-                    web_search_data = web_search_memories[0].value
-                
-                # Create a UserProfileMemory object
-                memory = models.UserProfileMemory(
-                    profile=profile_data,
-                    topics=topics_data,
-                    grammar_corrections=grammar_data,
-                    web_search=web_search_data
-                )
-                
-                return models.AgentMemoryResponse(
-                    user_id=user_id,
-                    memory=memory
-                )
-    except Exception as e:
-        logging.error(f"Error retrieving memory for user {user_id}: {str(e)}", exc_info=True)
-        raise
+    app = get_agent_graph()
+    input_messages = [HumanMessage(content=request.content)]
+    final_response = None
 
-def reset_user_memory(redis_client: redis.Redis, user_id: UUID) -> None:
-    """
-    Reset (delete) the agent's memory for a user
-    """
     try:
-        # Initialize a Redis connection for LangGraph
-        redis_uri = f"redis://{redis_client.connection_pool.connection_kwargs.get('host', 'localhost')}:{redis_client.connection_pool.connection_kwargs.get('port', 6379)}/0"
+        # Collect all messages during streaming
+        all_messages = []
         
-        # Setup LangGraph components
-        with RedisSaver.from_conn_string(redis_uri) as checkpointer:
-            
-            with RedisStore.from_conn_string(redis_uri) as store:
-
-                # Delete profile memory
-                profile_memories = store.search(("profile", str(user_id)))
-                for mem in profile_memories:
-                    store.delete(("profile", str(user_id)), mem.key)
-                    
-                # Delete topic memory
-                topic_memories = store.search(("topic", str(user_id)))
-                for mem in topic_memories:
-                    store.delete(("topic", str(user_id)), mem.key)
-                    
-                # Delete grammar memory
-                grammar_memories = store.search(("grammar", str(user_id)))
-                for mem in grammar_memories:
-                    store.delete(("grammar", str(user_id)), mem.key)
-                    
-                # Delete web search memory
-                web_search_memories = store.search(("web_search", str(user_id)))
-                for mem in web_search_memories:
-                    store.delete(("web_search", str(user_id)), mem.key)
+        # Asynchronously stream the graph's execution
+        async for chunk in app.astream(
+            {"messages": input_messages}, config, stream_mode="values"
+        ):
+            if "messages" in chunk and chunk["messages"]:
+                all_messages = chunk["messages"]  # Keep the latest complete version
                 
-        logging.info(f"Memory reset for user {user_id}")
+                # Get the last message from the chunk
+                last_message = chunk["messages"][-1]
+                
+                # DEBUG: Log message details to understand structure
+                logging.info(f"DEBUG - Message type: {type(last_message)}")
+                logging.info(f"DEBUG - Message content: {last_message.content[:100] if hasattr(last_message, 'content') else 'No content'}")
+                logging.info(f"DEBUG - Has name attribute: {hasattr(last_message, 'name')}")
+                if hasattr(last_message, 'name'):
+                    logging.info(f"DEBUG - Name value: {last_message.name}")
+                
+                # CORRECTION: Identify final response from responder
+                # Can be AIMessage without name OR with name None
+                if (isinstance(last_message, AIMessage) and 
+                    (not hasattr(last_message, 'name') or last_message.name is None) and 
+                    last_message.content.strip()):
+                    final_response = last_message
+                    logging.info(f"Final response captured from responder: {last_message.content[:100]}...")
+                    break  # Important: exit loop once final response is found
+                
+                # ALTERNATIVE: If above condition doesn't work, try to capture 
+                # the last AI message regardless of name (as fallback)
+                elif isinstance(last_message, AIMessage) and last_message.content.strip():
+                    # Check if it's not from a known agent
+                    if not (hasattr(last_message, 'name') and 
+                           last_message.name in ['supervisor', 'correction', 'researcher', 'enhancer', 'validator']):
+                        final_response = last_message
+                        logging.info(f"Final response captured (fallback): {last_message.content[:100]}...")
+        
+        # If not found during streaming, search in final list
+        if final_response is None and all_messages:
+            logging.info("Searching for final response in all messages...")
+            # Search backwards for a valid AI message
+            for msg in reversed(all_messages):
+                if (isinstance(msg, AIMessage) and 
+                    msg.content.strip() and 
+                    not (hasattr(msg, 'name') and 
+                         msg.name in ['supervisor', 'correction', 'researcher', 'enhancer', 'validator'])):
+                    final_response = msg
+                    logging.info(f"Final response found in message history: {msg.content[:100]}...")
+                    break
+
+        if final_response is None:
+            raise Exception("Agent did not produce a final response.")
+
+        # --- UPDATE CONVERSATION INDEX IN REDIS ---
+        index_key = f"user_conversations:{user_id}"
+        timestamp = time()
+                
+        # For existing chats, find the old entry to update its timestamp
+        old_member = None
+        members = redis_client.zrange(index_key, 0, -1)
+        for member_json in members:
+            member_data = json.loads(member_json)
+            if member_data.get("id") == str(conversation_id):
+                old_member = member_json
+                break
+
+        if old_member:
+            # To update the score, we remove the old member and add it back
+            # with the new timestamp. The content (title) remains the same.
+            redis_client.zrem(index_key, old_member)
+            redis_client.zadd(index_key, {old_member: timestamp})
+            logging.info(f"Updated timestamp for conversation {conversation_id} for user {user_id}.")
+        else:
+            logging.warning(f"Conversation {conversation_id} not found in index for user {user_id}")
+
+        return models.AgentResponse(
+            response=final_response.content,
+            conversation_id=conversation_id,
+        )
+
     except Exception as e:
-        logging.error(f"Error resetting memory for user {user_id}: {str(e)}", exc_info=True)
+        logging.error(
+            f"Error during agent execution for user {user_id} in conversation {conversation_id}: {e}"
+        )
+        # Re-raise the exception to be handled by the controller
+        logging.error(traceback.format_exc())
         raise

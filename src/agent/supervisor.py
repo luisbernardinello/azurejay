@@ -1,0 +1,304 @@
+from typing import Annotated, Sequence, List, Literal 
+from pydantic import BaseModel, Field 
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_community.tools.tavily_search import TavilySearchResults 
+from langgraph.types import Command 
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import create_react_agent 
+from dotenv import load_dotenv
+from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.runnables import RunnableConfig
+from langgraph.store.base import BaseStore
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
+# from src.database.core import get_checkpointer, get_store
+checkpointer = InMemorySaver()
+store = InMemoryStore()
+# modules import
+
+from .responder import create_responder_subgraph
+from .language_tool import LanguageToolAPI
+from . import configuration
+
+load_dotenv(override=True)
+
+# Use Groq LLM as in the second example
+llm = ChatGroq(model="llama-3.3-70b-versatile")
+language_tool = LanguageToolAPI(base_url="https://api.languagetool.org/v2")
+llm_verifier = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+# Initialize search tool
+web_search = TavilySearchResults(max_results=2)
+
+
+class Supervisor(BaseModel):
+    next: Literal["correction", "researcher"] = Field(
+        description="Determines which specialist to activate next in the workflow sequence: "
+                    "'correction' for grammar checking (should always be called first), "
+                    "'researcher' when information gathering is needed."
+    )
+    reason: str = Field(
+        description="Detailed justification for the routing decision, explaining the rationale behind selecting the particular specialist and how this advances the task toward completion."
+    )
+
+def get_last_user_message(state: MessagesState) -> str:
+    """Extract the last user message (not from agents)"""
+    last_user_message = next(
+        (msg.content for msg in reversed(state["messages"]) 
+         if isinstance(msg, HumanMessage) and not hasattr(msg, 'name') or msg.name is None), 
+        ""
+    )
+    return last_user_message
+
+def supervisor_node(state: MessagesState) -> Command[Literal["correction", "researcher"]]:
+    """
+    Supervisor node that manages workflow between specialized agents.
+    Routes tasks to appropriate specialists based on the current state.
+    """
+    system_prompt = '''
+    You are a workflow supervisor managing a team of specialized agents. Your role is to orchestrate the workflow by selecting the most appropriate next agent based on the current state and needs of the task. Provide a clear, concise rationale for each decision to ensure transparency in your decision-making process.
+    Work with one agent at a time, do not call agents in parallel.
+
+    #Team Members:
+    1. **Correction Agent**: Always consider this agent first. They check and correct grammar errors in English text.
+    2. **Researcher Agent**: Specializes in information gathering, fact-finding, and collecting relevant data needed to address the user's request.
+    
+    #Your workflow:
+    1. ALWAYS start by calling the Correction Agent to check for grammar errors
+    2. ONLY if the user asks a clear, direct question with NO grammar errors, that requires updated information (e.g., 'Who won the NBA game last night?'), call the Researcher Agent
+        
+    #Important limitations
+    1. You do NOT evaluate the quality of any agent's work
+    2. You do NOT provide feedback on any agent's output
+    3. You do NOT modify any agent's content
+
+    CRITICAL: For messages that are statements (not questions), follow this workflow only:
+    1. Call Correction Agent
+    DO NOT call Researcher Agent for statements.
+    
+    Your objective is to create an efficient workflow that leverages each agent's strengths while minimizing unnecessary steps.
+    '''
+    
+    # Only get the last user message for the supervisor decision
+    last_user_msg = get_last_user_message(state)
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": last_user_msg}
+    ] 
+
+    response = llm.with_structured_output(Supervisor).invoke(messages)
+
+    goto = response.next
+    reason = response.reason
+
+    print(f"--- Workflow Transition: Supervisor → {goto.upper()} ---")
+    
+    return Command(
+        update={
+            "messages": [
+                HumanMessage(content=reason, name="supervisor")
+            ]
+        },
+        goto=goto,  
+    )
+
+def correction_node(state: MessagesState) -> Command[Literal["responder"]]:
+    print("--- Correction Node: ---")
+
+    # 1. Get the last user message (not from agents)
+    last_user_message_obj = next(
+        (msg for msg in reversed(state["messages"]) if isinstance(msg, HumanMessage) and (not hasattr(msg, 'name') or msg.name is None)), None
+    )
+    if not last_user_message_obj:
+        return Command(update={"messages": [HumanMessage(content="CORRECT", name="correction")]}, goto="responder")
+    
+    user_message_content = last_user_message_obj.content
+    print(f"Analyzing user message: '{user_message_content}' ---")
+
+    # --- LAYER 1: LANGUAGETOOL (SYNTAX) ---
+    lt_found_errors = False
+    lt_corrected_text = user_message_content
+    try:
+        lt_result = language_tool.check_text(user_message_content)
+        if lt_result.errors:
+            lt_found_errors = True
+            lt_corrected_text = lt_result.corrected_text
+            print(f"LanguageTool found errors. LT Corrected Text: '{lt_corrected_text}' ---")
+        else:
+            print("LanguageTool found NO syntax errors. ---")
+    except Exception as e:
+        print(f"LanguageTool API failed: {e}. Using original text for next steps. ---")
+
+    # --- LAYER 2: LLM VERIFIER (SEMANTICS) ---
+    verifier_made_semantic_correction = False
+    text_after_semantic_check = user_message_content
+
+    if user_message_content.strip() and len(user_message_content.split()) > 1:
+        print("--- Semantic Correction layer (Verifier) ---")
+        try:
+            semantic_correction_prompt = f'''
+            You are a semantic correction specialist for English language learners.
+            Analyze the following sentence: "{user_message_content}"
+            1. Identify ONLY semantic or contextual errors. Do NOT focus on minor punctuation or pure grammatical errors unless they create semantic ambiguity.
+            2. If you find semantic errors, provide the sentence corrected ONLY for those semantic errors.
+            3. If you find NO semantic errors, respond with the exact string "NO_SEMANTIC_ERRORS_FOUND".
+            Respond with ONLY the semantically corrected sentence or "NO_SEMANTIC_ERRORS_FOUND".
+            '''
+            messages_for_verifier = [
+                SystemMessage(content="You are a precise linguistic analyst focusing on semantic corrections."),
+                HumanMessage(content=semantic_correction_prompt)
+            ]
+            verifier_response = llm_verifier.invoke(messages_for_verifier)
+            print(f"Verifier response: '{verifier_response.content}' ---")
+
+            if verifier_response.content.strip().upper() != "NO_SEMANTIC_ERRORS_FOUND" and verifier_response.content.strip() != user_message_content.strip():
+                verifier_made_semantic_correction = True
+                text_after_semantic_check = verifier_response.content.strip()
+                print(f"Verifier made a semantic correction: '{text_after_semantic_check}' ---")
+            else:
+                print("Verifier found NO semantic errors or made no changes. ---")
+        except Exception as e:
+            print(f"Verifier failed: {e}. Assuming no semantic correction made by verifier. ---")
+    else:
+        print("Skipping Semantic Correction due to empty or trivial user message. ---")
+        
+    # --- DECISION LOGIC AND SYNTHESIS ---
+    final_correction_content = ""
+
+    if not lt_found_errors and not verifier_made_semantic_correction:
+        print("No errors/corrections by any tool. Outputting CORRECT. ---")
+        final_correction_content = "CORRECT"
+    else:
+        print("Corrections suggested. Performing synthesis. ---")
+        
+        synthesizer_prompt_system = f'''
+        You are an expert English language editor. Your task is to produce a final, perfectly corrected sentence for an English learner, based on the original text and suggestions from other tools.
+
+        Original user sentence: "{user_message_content}"
+
+        Tool 1 (LanguageTool - Syntax) analysis:
+        - Detected syntax errors: {"YES" if lt_found_errors else "NO"}
+        - LanguageTool's suggested correction (if any): "{lt_corrected_text if lt_found_errors else 'N/A'}"
+
+        Tool 2 (Verifier LLM - Semantics) analysis:
+        - Detected/Corrected semantic issues: {"YES" if verifier_made_semantic_correction else "NO"}
+        - Verifier LLM's suggested semantic correction (if any): "{text_after_semantic_check if verifier_made_semantic_correction else 'N/A'}"
+
+        Your Task:
+        1. Review the Original user sentence.
+        2. Consider the corrections suggested by LanguageTool (focused on syntax) and the Verifier LLM (focused on semantics).
+        3. Produce ONE single, final, perfectly corrected version of the original sentence that integrates the best of these suggestions and your own expertise.
+        4. If, after reviewing all inputs, you believe the Original user sentence was already perfect AND no tools made valid corrections, respond with the exact string "CORRECT".
+        5. Otherwise, respond ONLY with the fully corrected sentence.
+        '''
+        
+        # Only use the current message for synthesis, not full history
+        messages_for_synthesizer = [
+            SystemMessage(content=synthesizer_prompt_system),
+            HumanMessage(content=user_message_content)
+        ]
+
+        synthesis_response = llm.invoke(messages_for_synthesizer)
+        final_correction_content = synthesis_response.content.strip()
+        print(f"Synthesizer response: '{final_correction_content}' ---")
+
+    print(f"Outputting '{final_correction_content}' with name 'correction'. ---")
+    return Command(
+        update={"messages": [HumanMessage(content=final_correction_content, name="correction")]},
+        goto="responder",
+    )
+    
+    
+def research_node(state: MessagesState) -> Command[Literal["responder"]]:
+    """
+    Research agent node that gathers information using web search.
+    Takes the current task state, performs relevant research,
+    and returns findings to responder.
+    """
+    
+    research_agent = create_react_agent(
+        llm,  
+        tools=[web_search],  
+        state_modifier="You are an Information Specialist with expertise in comprehensive research. Your responsibilities include:\n\n"
+            "1. Identifying key information needs based on the query context\n"
+            "2. Gathering relevant, accurate, and up-to-date information from reliable sources\n"
+            "3. Organizing findings in a structured, easily digestible format\n"
+            "4. Citing sources when possible to establish credibility\n"
+            "5. Focusing exclusively on information gathering - avoid analysis or implementation\n\n"
+            "Provide thorough, factual responses without speculation where information is unavailable."
+    )
+
+    # Get the last relevant message (either from supervisor or user)
+    last_relevant_message = None
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, HumanMessage):
+            if hasattr(msg, 'name') and msg.name == "supervisor":
+                last_relevant_message = msg
+                break
+            elif not hasattr(msg, 'name') or msg.name is None:
+                last_relevant_message = msg
+                break
+    
+    # Create a minimal state for the research agent
+    research_state = {"messages": [last_relevant_message] if last_relevant_message else state["messages"][-1:]}
+    
+    result = research_agent.invoke(research_state)
+
+    print(f"--- Workflow Transition: Researcher → Responder ---")
+
+    return Command(
+        update={
+            "messages": [ 
+                HumanMessage(
+                    content=result["messages"][-1].content,  
+                    name="researcher"  
+                )
+            ]
+        },
+        goto="responder", 
+    )
+
+def call_responder_subgraph(state: MessagesState, config: RunnableConfig):
+    """
+    Node function that calls the responder subgraph.
+    This transforms the supervisor state to the subgraph state and invokes it.
+    """
+    # Create the responder subgraph
+    responder_subgraph = create_responder_subgraph()
+    
+    print(f"--- Workflow Transition: Responder Subgraph Started ---")
+    
+    # Invoke the subgraph with the current state and config
+    result = responder_subgraph.invoke(state, config)
+    
+    print(f"--- Workflow Transition: Responder Subgraph Completed → END ---")
+    
+    # Return the result as a Command to END
+    return Command(
+        update={
+            "messages": result["messages"]
+        },
+        goto=END,
+    )
+    
+def create_agent_graph():
+    """
+    This function creates and compiles the main agent graph.
+    """
+    graph = StateGraph(MessagesState, config_schema=configuration.Configuration)
+
+    # Add all the nodes to the graph
+    graph.add_node("supervisor", supervisor_node)
+    graph.add_node("correction", correction_node)
+    graph.add_node("researcher", research_node)
+    graph.add_node("responder", call_responder_subgraph)
+
+    # --- Edge Definition ---
+    # The graph starts at the supervisor. All other routing is handled
+    # by the 'goto' in the Command objects returned by the nodes.
+    graph.add_edge(START, "supervisor")
+
+    # Compile the graph with the provided persistence objects.
+    app = graph.compile(checkpointer=checkpointer, store=store)
+    return app

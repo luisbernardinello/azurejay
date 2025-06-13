@@ -159,8 +159,8 @@ cd AzureJay
 #### How to run app. Using Docker with PostgreSQL.
 
 - Install Docker Desktop
-- Run `docker compose up --build`
-- Run `docker compose down` to stop all services
+- Run `docker-compose up --build`
+- Run `docker-compose down` to stop all services
 
 #### How to run tests.
 

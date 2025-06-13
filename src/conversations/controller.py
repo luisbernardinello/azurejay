@@ -1,109 +1,73 @@
-from fastapi import APIRouter, status, HTTPException
+# src/conversations/controller.py
+from fastapi import APIRouter, HTTPException, status
 from uuid import UUID
 from typing import List
+import logging
 
-from src.database.core import RedisClient
+from src.database.core import RedisDep, CheckpointerDep
 from src.auth.service import CurrentUser
-from . import models
-from . import service
+from . import models, service
 
 router = APIRouter(
     prefix="/conversations",
     tags=["Conversations"]
 )
 
-
-@router.post("/", status_code=status.HTTP_201_CREATED, response_model=UUID)
-def create_conversation(
-    conversation_data: models.ConversationCreate,
-    redis_client: RedisClient,
+@router.get("/", response_model=List[models.ConversationListItem])
+def list_user_conversations(
+    redis: RedisDep,
     current_user: CurrentUser
 ):
     """
-    Cria uma nova conversa para o usuário
+    Returns the list of conversations for the authenticated user,
+    sorted by the most recently updated.
     """
-    return service.create_conversation(
-        redis_client, 
-        current_user.get_uuid(), 
-        conversation_data
-    )
+    user_id = current_user.get_uuid()
+    return service.get_user_conversations_list(redis, user_id)
 
-
-@router.get("/", response_model=List[models.ConversationResponse])
-def get_user_conversations(
-    redis_client: RedisClient,
-    current_user: CurrentUser
-):
-    """
-    Retorna todas as conversas do usuário
-    """
-    return service.get_user_conversations(redis_client, current_user.get_uuid())
-
-
-@router.get("/{conversation_id}", response_model=models.ConversationDetailResponse)
-def get_conversation(
+@router.get("/{conversation_id}", response_model=models.ConversationHistoryResponse)
+def get_conversation_details(
     conversation_id: UUID,
-    redis_client: RedisClient,
+    checkpointer: CheckpointerDep,
+    redis: RedisDep,
     current_user: CurrentUser
 ):
     """
-    Retorna os detalhes de uma conversa específica
+    Returns the detailed message history for a specific conversation.
+    Ensures the user has permission to view the conversation.
     """
-    return service.get_conversation(
-        redis_client, 
-        current_user.get_uuid(), 
-        conversation_id
-    )
+    user_id = current_user.get_uuid()
+    try:
+        return service.get_conversation_history(checkpointer, redis, user_id, conversation_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except Exception as e:
+        logging.error(f"An unexpected error occurred while fetching conversation {conversation_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An internal error occurred.")
 
-
-@router.post("/{conversation_id}/messages", response_model=models.MessageResponse)
-def add_message(
-    conversation_id: UUID,
-    message_data: models.MessageRequest,
-    redis_client: RedisClient,
-    current_user: CurrentUser
+@router.post("/new", response_model=models.NewConversationResponse, status_code=status.HTTP_201_CREATED)
+async def create_new_conversation(
+    current_user: CurrentUser,
+    redis: RedisDep,
+    request: models.NewConversationRequest
 ):
     """
-    Adiciona uma nova mensagem do usuário à conversa
+    Creates a new conversation with the first message from the user.
+    This endpoint is called when the user is on /new route and sends their first message.
+    Returns the AI response and the new conversation ID for frontend redirection.
     """
-    return service.add_message(
-        redis_client, 
-        current_user.get_uuid(), 
-        conversation_id, 
-        message_data
-    )
-
-
-@router.post("/{conversation_id}/system-messages", response_model=models.MessageResponse)
-def add_system_message(
-    conversation_id: UUID,
-    message_data: models.MessageRequest,
-    redis_client: RedisClient,
-    current_user: CurrentUser
-):
-    """
-    Adiciona uma nova mensagem do sistema à conversa
-    """
-    return service.add_message(
-        redis_client, 
-        current_user.get_uuid(), 
-        conversation_id, 
-        message_data,
-        is_user=False
-    )
-
-
-@router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_conversation(
-    conversation_id: UUID,
-    redis_client: RedisClient,
-    current_user: CurrentUser
-):
-    """
-    Exclui uma conversa
-    """
-    service.delete_conversation(
-        redis_client, 
-        current_user.get_uuid(), 
-        conversation_id
-    )
+    user_id = current_user.get_uuid()
+    try:
+        return await service.create_new_conversation(
+            redis_client=redis,
+            user_id=user_id,
+            request=request
+        )
+    except Exception as e:
+        logging.error(f"Error creating new conversation for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred while creating the conversation: {str(e)}"
+        )

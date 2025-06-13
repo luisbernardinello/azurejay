@@ -39,6 +39,7 @@ async def startup_db_client():
     # Descomentar a linha abaixo para apagar as tabelas existentes
     # Base.metadata.drop_all(bind=engine) 
     # Descomentar a linha abaixo para criar as tabelas automaticamente
+    
     Base.metadata.create_all(bind=engine)
 
 register_routes(app)
