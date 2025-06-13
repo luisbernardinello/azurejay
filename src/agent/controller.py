@@ -2,10 +2,11 @@
 from fastapi import APIRouter, status, Body, HTTPException, Path
 from uuid import UUID
 
-from src.database.core import CheckpointerDep, StoreDep, RedisDep
+from src.database.core import DbSession, CheckpointerDep, StoreDep
 from src.auth.service import CurrentUser
 from . import models
 from . import service
+from src.conversations.service import add_message_to_conversation
 
 router = APIRouter(
     prefix="/agent",
@@ -20,18 +21,19 @@ router = APIRouter(
 async def chat_with_existing_conversation(
     conversation_id: UUID = Path(..., description="The ID of the existing conversation"),
     current_user: CurrentUser = None,
-    redis_client: RedisDep = None,
+    db: DbSession = None,
     request: models.AgentChatRequest = Body(...)
 ):
     """
     Endpoint for continuing a conversation with the AI tutor.
     This endpoint is used when the user is on /chat/{id} route.
+    Uses PostgreSQL for conversation storage and Redis only for agent state.
     """
     user_id = current_user.get_uuid()
     
     try:
         # Validate that the conversation exists and belongs to the user
-        await service.validate_conversation_access(redis_client, user_id, conversation_id)
+        await service.validate_conversation_access(db, user_id, conversation_id)
         
         # Create the agent request with the existing conversation ID
         agent_request = models.AgentRequest(
@@ -40,9 +42,10 @@ async def chat_with_existing_conversation(
         )
         
         return await service.chat_with_agent(
-            redis_client=redis_client,
+            db=db,
             user_id=user_id,
-            request=agent_request
+            request=agent_request,
+            add_message_func=add_message_to_conversation
         )
     except PermissionError as e:
         raise HTTPException(

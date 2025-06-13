@@ -1,45 +1,23 @@
-from pydantic import BaseModel, Field
-from uuid import UUID, uuid4
+from sqlalchemy import Column, String, DateTime, Text, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.orm import relationship
+import uuid
 from datetime import datetime
-from typing import List, Literal, Optional
+from ..database.core import Base
 
 
-class Message(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
-    content: str
-    timestamp: datetime = Field(default_factory=datetime.now)
-    role: Literal['human', 'ai']
-    correction: Optional[str] = None
-
-class Conversation(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
-    user_id: UUID
-    title: str
-    messages: List[Message] = []
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
+class Conversation(Base):
+    __tablename__ = 'conversations'
     
-    def add_message(self, content: str, role: Literal['human', 'ai']) -> Message:
-        """
-        Adiciona uma nova mensagem à conversa e atualiza o timestamp
-        """
-        message = Message(
-            content=content,
-            role=role
-        )
-        self.messages.append(message)
-        self.updated_at = datetime.now()
-        return message
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id'), nullable=False)
+    title = Column(String(255), nullable=False)
+    messages = Column(JSONB, nullable=False, default=list)  # Armazena as mensagens como JSON
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
-    def model_dump_json(self) -> str:
-        """
-        Converte a conversa para JSON para armazenamento
-        """
-        return super().model_dump_json()
+    # Relacionamento com User
+    user = relationship("User", back_populates="conversations")
     
-    @classmethod
-    def from_json(cls, json_data: str) -> "Conversation":
-        """
-        Cria uma instância de Conversation a partir de dados JSON
-        """
-        return cls.model_validate_json(json_data)
+    def __repr__(self):
+        return f"<Conversation(id='{self.id}', title='{self.title}', user_id='{self.user_id}')>"

@@ -4,11 +4,15 @@ import logging
 from time import time
 from uuid import UUID, uuid4
 import traceback
+from typing import Callable, Awaitable
+from sqlalchemy.orm import Session
 from langchain_core.messages import HumanMessage, AIMessage
-from src.database.core import CheckpointerDep, RedisDep, StoreDep
 
 from . import models
 from .supervisor import create_agent_graph
+from ..entities.conversation import Conversation
+from ..exceptions import ConversationNotFoundError
+# REMOVIDO: from ..conversations.service import add_message_to_conversation
 
 # A global variable to hold the compiled graph singleton
 agent_graph = None
@@ -25,51 +29,57 @@ def get_agent_graph(): # type: ignore
     return agent_graph
 
 async def validate_conversation_access(
-    redis_client: RedisDep,
+    db: Session,
     user_id: UUID,
     conversation_id: UUID
 ) -> None:
     """
-    Validates that a conversation exists and belongs to the specified user.
+    Validates that a conversation exists and belongs to the specified user in PostgreSQL.
     Raises appropriate exceptions if validation fails.
     """
-    index_key = f"user_conversations:{user_id}"
-    
     try:
-        # Get all conversations for the user
-        conv_data = redis_client.zrange(index_key, 0, -1)
+        # Check if the conversation exists and belongs to the user
+        conversation = (
+            db.query(Conversation)
+            .filter(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user_id
+            )
+            .first()
+        )
         
-        # Check if the conversation exists in the user's list
-        conversation_found = False
-        for item_json in conv_data:
-            item_data = json.loads(item_json)
-            if item_data['id'] == str(conversation_id):
-                conversation_found = True
-                break
-        
-        if not conversation_found:
-            raise FileNotFoundError(f"Conversation {conversation_id} not found or does not belong to user {user_id}")
+        if not conversation:
+            raise ConversationNotFoundError(conversation_id)
             
-    except json.JSONDecodeError as e:
-        logging.error(f"Error parsing conversation data for user {user_id}: {e}")
-        raise Exception("Error validating conversation access")
+    except ConversationNotFoundError:
+        raise
     except Exception as e:
         logging.error(f"Error validating conversation access for user {user_id}, conversation {conversation_id}: {e}")
         raise
 
 async def chat_with_agent(
-    redis_client: RedisDep,
+    db: Session,
     user_id: UUID,
     request: models.AgentRequest,
+    add_message_func: Callable[[Session, UUID, UUID, str, str], None]  # INJEÇÃO DE DEPENDÊNCIA
 ) -> models.AgentResponse:
     """
-    Processes a chat message with the AI agent and updates the conversation index.
+    Processes a chat message with the AI agent and updates the conversation in PostgreSQL.
     This function is used for continuing existing conversations (when conversation_id is provided).
+    
+    Args:
+        db: Database session
+        user_id: User ID
+        request: Agent request
+        add_message_func: Function to add messages to conversation (injected dependency)
     """
     if not request.conversation_id:
         raise ValueError("conversation_id is required for chat_with_agent. Use create_new_conversation for new conversations.")
     
     conversation_id = request.conversation_id
+    
+    # Validate conversation access first
+    await validate_conversation_access(db, user_id, conversation_id)
     
     config = {
         "configurable": {
@@ -137,27 +147,14 @@ async def chat_with_agent(
         if final_response is None:
             raise Exception("Agent did not produce a final response.")
 
-        # --- UPDATE CONVERSATION INDEX IN REDIS ---
-        index_key = f"user_conversations:{user_id}"
-        timestamp = time()
-                
-        # For existing chats, find the old entry to update its timestamp
-        old_member = None
-        members = redis_client.zrange(index_key, 0, -1)
-        for member_json in members:
-            member_data = json.loads(member_json)
-            if member_data.get("id") == str(conversation_id):
-                old_member = member_json
-                break
-
-        if old_member:
-            # To update the score, we remove the old member and add it back
-            # with the new timestamp. The content (title) remains the same.
-            redis_client.zrem(index_key, old_member)
-            redis_client.zadd(index_key, {old_member: timestamp})
-            logging.info(f"Updated timestamp for conversation {conversation_id} for user {user_id}.")
-        else:
-            logging.warning(f"Conversation {conversation_id} not found in index for user {user_id}")
+        # --- ADD MESSAGES TO CONVERSATION USING INJECTED FUNCTION ---
+        add_message_func(
+            db=db,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            human_message=request.content,
+            ai_response=final_response.content
+        )
 
         return models.AgentResponse(
             response=final_response.content,
